@@ -594,7 +594,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
             self.assertEqual(all_data[-1]["status"], "fail_phase1")
 
-    def test_worker_no_balance_saves_fail_phase1_and_stops(self):
+    def test_worker_no_numbers_releases_email_without_failed_record_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             pool_path = tmp_path / "pool.json"
@@ -623,7 +623,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
                     "phone": "?",
                     "password": "pw",
                     "activation_id": "",
-                    "error": "获取号码失败: NO_BALANCE",
+                    "error": "获取号码失败: NO_NUMBERS",
                 }
 
             worker_pool.ar.register_one = fake_register_one
@@ -649,13 +649,12 @@ class WorkerPoolComponentTests(unittest.TestCase):
 
             self.assertTrue(stop.is_set())
             self.assertEqual(calls["register"], 1)
-            all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
-            self.assertEqual(all_data[-1]["status"], "fail_phase1")
-            self.assertEqual(all_data[-1]["phone"], "?")
-            self.assertEqual(all_data[-1]["password"], "pw")
+            self.assertFalse((tmp_path / "results" / "_all.json").exists())
             files = list((tmp_path / "results").glob("*_fail_phase1.json"))
-            self.assertEqual(len(files), 1)
-            self.assertTrue(files[0].name.startswith("unknown_"))
+            self.assertEqual(files, [])
+            records = json.loads(used_file.read_text(encoding="utf-8"))["records"]
+            self.assertEqual(records, {})
+            self.assertEqual(allocator.pool.get_available_email(), "one@example.com")
 
     def test_worker_complete_failure_is_not_counted_as_success(self):
         with tempfile.TemporaryDirectory() as tmp:

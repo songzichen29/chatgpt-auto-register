@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -138,13 +139,13 @@ def account_key(record: dict) -> str:
     if sub_id:
         return f"sub:{sub_id}"
     phone = str(record.get("phone") or "").strip()
-    if phone:
+    if phone and phone.lower() not in {"?", "-", "unknown", "none"}:
         return f"phone:{phone}"
     email = normalize_email(record.get("bind_email") or record.get("email"))
     if email:
         return f"email:{email}"
     raw = json.dumps(record, sort_keys=True, ensure_ascii=False)
-    return f"record:{abs(hash(raw))}"
+    return f"record:{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
 
 
 def normalize_reg_status(record: dict) -> str:
@@ -590,6 +591,67 @@ class AccountStore:
         entry["updated_at"] = utc_now()
         state[source_key] = entry
         self.save_state(state)
+
+    def delete_failed_record(self, key: str, *, restore_email: bool = True) -> dict:
+        key = unquote(key)
+        records = self.load_results()
+        target = next((r for r in records if account_key(r) == key), None)
+        if not target:
+            return {"ok": False, "error": "记录不存在"}
+        status = normalize_reg_status(target)
+        if status == "ok":
+            return {"ok": False, "error": "成功账号不能在失败记录里删除"}
+
+        email = normalize_email(target.get("bind_email") or target.get("email"))
+        kept = [r for r in records if account_key(r) != key]
+        deleted_count = len(records) - len(kept)
+        write_json_atomic(self.paths["all_results"], kept)
+
+        removed_files = 0
+        for path in self.paths["results_dir"].glob("*.json"):
+            if path.name in {"_all.json", "account_state.json", "pool_import_history.json"}:
+                continue
+            payload = read_json(path, None)
+            if isinstance(payload, dict) and account_key(payload) == key:
+                try:
+                    path.unlink()
+                    removed_files += 1
+                except FileNotFoundError:
+                    pass
+
+        state = self.load_state()
+        state.pop(key, None)
+        self.save_state(state)
+
+        restored = False
+        if restore_email and email:
+            try:
+                from msoutlook_pool import MsOutlookPool
+                pool = MsOutlookPool(pool_path=str(self.paths["pool"]), used_file=str(self.paths["used"]), verbose=False)
+                pool.mark_unused(email)
+                restored = True
+            except Exception:
+                restored = False
+            try:
+                pool_items = read_json(self.paths["pool"], [])
+                pool_changed = False
+                if isinstance(pool_items, list):
+                    for item in pool_items:
+                        if isinstance(item, dict) and normalize_email(item.get("email")) == email and item.get("used"):
+                            item["used"] = False
+                            pool_changed = True
+                    if pool_changed:
+                        write_json_atomic(self.paths["pool"], pool_items)
+                        restored = True
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "deleted": deleted_count,
+            "removed_files": removed_files,
+            "restored_email": email if restored else "",
+        }
 
 
 def apply_state_patch(entry: dict, patch: dict) -> None:
@@ -1373,6 +1435,14 @@ def create_worker_control_blueprint(root: Path, worker_controller: Optional[Work
     def api_account_state(key: str):
         try:
             return jsonify(store.patch_state(key, request.json or {}))
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)})
+
+    @bp.route("/api/accounts/failed/<path:key>", methods=["DELETE"])
+    def api_failed_account_delete(key: str):
+        try:
+            restore = bool((request.json or {}).get("restore_email", True)) if request.is_json else True
+            return jsonify(store.delete_failed_record(key, restore_email=restore))
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)})
 

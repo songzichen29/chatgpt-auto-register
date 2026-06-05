@@ -112,6 +112,55 @@ class WorkerControlTests(unittest.TestCase):
         self.assertEqual(failed["total"], 2)
         self.assertTrue(all(x["reg_status"] != "ok" for x in failed["items"]))
 
+    def test_delete_failed_record_removes_files_and_restores_email(self):
+        tmp, root = self.make_root()
+        self.addCleanup(tmp.cleanup)
+        self.write_json(root / "号.json", [
+            {"email": "bad@example.test", "enabled": True, "used": True},
+            {"email": "ok@example.test", "enabled": True, "used": False},
+        ])
+        self.write_json(root / "msoutlook_used.json", {"records": {
+            "bad@example.test": {"status": "error", "phone": "+2", "error": "phase1 failed"},
+        }})
+        failed_record = {
+            "status": "fail_phase1",
+            "phone": "+2",
+            "password": "p",
+            "bind_email": "bad@example.test",
+            "saved_at": "2026-06-05T02:00:00",
+        }
+        ok_record = {
+            "status": "ok",
+            "phone": "+1",
+            "password": "p",
+            "bind_email": "ok@example.test",
+            "sub2api_id": "1",
+            "saved_at": "2026-06-05T01:00:00",
+        }
+        self.write_json(root / "results" / "_all.json", [ok_record, failed_record])
+        self.write_json(root / "results" / "account_state.json", {
+            "phone:+2": {"usage_status": "bad", "note": "remove me"},
+            "sub:1": {"usage_status": "used"},
+        })
+        self.write_json(root / "results" / "2_fail_phase1.json", failed_record)
+
+        store = worker_control.AccountStore(root)
+        result = store.delete_failed_record("phone:+2")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["restored_email"], "bad@example.test")
+        self.assertFalse((root / "results" / "2_fail_phase1.json").exists())
+
+        all_results = worker_control.read_json(root / "results" / "_all.json", [])
+        self.assertEqual(len(all_results), 1)
+        self.assertEqual(all_results[0]["status"], "ok")
+        state = worker_control.read_json(root / "results" / "account_state.json", {})
+        self.assertNotIn("phone:+2", state)
+        self.assertIn("sub:1", state)
+        used = worker_control.read_json(root / "msoutlook_used.json", {})
+        self.assertNotIn("bad@example.test", used.get("records", {}))
+        pool = worker_control.read_json(root / "号.json", [])
+        self.assertFalse(next(x for x in pool if x["email"] == "bad@example.test")["used"])
+
     def test_export_sub_payload_marks_exported(self):
         tmp, root = self.make_root()
         self.addCleanup(tmp.cleanup)

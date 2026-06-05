@@ -246,7 +246,12 @@ class EmailAllocator:
 
     def _release(self, email: str, cooldown: float) -> None:
         with self.lock:
-            self._cooling[email] = time.time() + max(0.0, cooldown)
+            seconds = max(0.0, cooldown)
+            if seconds <= 0:
+                self._cooling.pop(email, None)
+                self.pool.mark_unused(email)
+                return
+            self._cooling[email] = time.time() + seconds
 
 
 class ResultWriter:
@@ -712,6 +717,11 @@ def _is_fatal_phase1_error(error: str) -> bool:
     return any(keyword in text for keyword in FATAL_PHASE1_KEYWORDS)
 
 
+def _has_real_phone(result: dict) -> bool:
+    phone = str((result or {}).get("phone") or "").strip()
+    return bool(phone and phone not in {"?", "-", "unknown", "None"})
+
+
 def worker(
     *,
     wid: int,
@@ -776,10 +786,16 @@ def worker(
         if not result or not result.get("ok"):
             state.record_phase1_failed()
             phase1_error = result.get("error", "") if result else ""
-            log(f"Phase 1 失败: {result.get('phone', '?')} {phase1_error}", "error")
-            _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "Phase 1 失败", log, state)
-            result_writer.append_account(_account_record("fail_phase1", result, lease.email))
-            lease.release(cooldown)
+            failed_phone = result.get("phone", "?") if isinstance(result, dict) else "?"
+            log(f"Phase 1 失败: {failed_phone} {phase1_error}", "error")
+            if _has_real_phone(result):
+                _sms_cancel_async(cfg, activation_id, failed_phone, "Phase 1 失败", log, state)
+                result_writer.append_account(_account_record("fail_phase1", result, lease.email))
+                lease.release(cooldown)
+            else:
+                # NO_NUMBERS/NO_BALANCE/BAD_KEY 发生在拿号前，邮箱没有真正参与注册，
+                # 不应进入失败记录，也不应冷却/占用邮箱。
+                lease.release(0)
             if _is_fatal_phase1_error(phase1_error):
                 global_stop.set()
                 log(f"检测到不可继续的 Phase 1 错误，停止所有 worker: {phase1_error}", "error")
