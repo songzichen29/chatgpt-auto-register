@@ -41,6 +41,8 @@
   "msoutlook": {
     "helper_url": "http://127.0.0.1:17373",
     "email": "",
-    "helper_bat": ""
+    "helper_bat": "",
+    "helper_mode": "http",
+    "helper_script": ""
   }
 }

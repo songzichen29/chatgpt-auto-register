@@ -3,6 +3,9 @@ services:
     image: ${IMAGE:-ghcr.io/songzichen29/chatgpt-auto-register:worker-control-dashboard}
     container_name: chatgpt-auto-register
     restart: unless-stopped
+    depends_on:
+      hotmail-helper:
+        condition: service_started
     ports:
       - "${HOST_BIND:-127.0.0.1}:${WEB_PORT:-7777}:8080"
     environment:
@@ -10,7 +13,7 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./config.json:/app/config.json
-      - ./?.json:/app/?.json
+      - ./号.json:/app/号.json
       - ./msoutlook_used.json:/app/msoutlook_used.json
       - ./email_blacklist.json:/app/email_blacklist.json
       - ./icloud_cookies.json:/app/icloud_cookies.json
@@ -23,3 +26,25 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  hotmail-helper:
+    image: ${HELPER_IMAGE:-ghcr.io/songzichen29/chatgpt-auto-register-hotmail-helper:worker-control-dashboard}
+    build:
+      context: ./src/deploy/hotmail-helper
+    container_name: chatgpt-auto-register-hotmail-helper
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PYTHONUNBUFFERED: "1"
+      HOTMAIL_HELPER_HOST: 0.0.0.0
+      HOTMAIL_HELPER_PORT: 17373
+    volumes:
+      - ./helper-data:/helper/data
+    expose:
+      - "17373"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 17373), 3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
