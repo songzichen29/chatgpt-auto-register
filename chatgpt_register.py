@@ -197,9 +197,11 @@ class ChatGPTRegister:
                 timeout=30,
             )
             data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-        except Exception:
+        except Exception as exc:
             data = {}
+            data["_error"] = f"{type(exc).__name__}: {exc}"
         data["_status"] = r.status_code if r is not None else 0
+        data["_body"] = r.text[:500] if r is not None and r.text else ""
         return data
 
     # ---- Step 6: 发送手机验证码 ----
@@ -250,9 +252,11 @@ class ChatGPTRegister:
         payload: dict,
         *,
         referer: str,
-        flow: str,
+        flow: str = "",
         allow_redirects: bool | None = None,
         timeout: int = 30,
+        sentinel: bool = True,
+        rebuild_on_transport: bool = True,
     ) -> dict:
         """向 auth.openai.com 发送 JSON POST，并对 curl 55 做 HTTP/1.1 短连接兜底。
 
@@ -263,7 +267,10 @@ class ChatGPTRegister:
         # 第一枪必须使用当前会话：OTP send 和 validate 之间的授权步骤
         # 对 auth.openai.com 的当前 cookie/会话上下文很敏感。只有遇到
         # 传输层异常时，第二枪才 rebuild 并强制 HTTP/1.1 短连接兜底。
-        attempts = [("current", False)] if self.proxy else [("current", False), ("http1-rebuild", True)]
+        if self.proxy or not rebuild_on_transport:
+            attempts = [("current", False)]
+        else:
+            attempts = [("current", False), ("http1-rebuild", True)]
         last_data: dict = {}
         errors = []
 
@@ -278,11 +285,12 @@ class ChatGPTRegister:
             }
             if force_http1:
                 headers["connection"] = "close"
-            try:
-                self._sentinel_cache.pop(flow, None)
-                self._add_sentinel_headers(headers, flow)
-            except Exception:
-                pass
+            if sentinel and flow:
+                try:
+                    self._sentinel_cache.pop(flow, None)
+                    self._add_sentinel_headers(headers, flow)
+                except Exception:
+                    pass
 
             r = None
             error = ""
@@ -318,11 +326,16 @@ class ChatGPTRegister:
     # ---- Step 7: 验证 OTP 验证码 ----
     def validate_otp(self, code: str) -> dict:
         self._log(7, "POST /api/accounts/phone-otp/validate ...")
+        # phone-otp/validate 属于 contact_verification 当前步骤。另一套稳定的
+        # OpenAI 后半段实现也是普通 JSON POST，不额外携带 authorize_continue
+        # Sentinel。给这里强塞 authorize_continue token 可能让服务端认为
+        # authorization step 不匹配，从而返回 session no longer valid。
         return self._post_auth_json_with_fallback(
             "/api/accounts/phone-otp/validate",
             {"code": code},
             referer=f"{AUTH}/contact-verification",
-            flow="authorize_continue",
+            sentinel=False,
+            rebuild_on_transport=False,
         )
 
     # ---- Step 8: 创建账户 (用户名+生日) ----

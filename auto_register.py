@@ -249,7 +249,9 @@ def register_one(
             register_result = _retry_call(lambda: reg_obj.register_user(phone, password), sr, label="注册")
             next_url = register_result.get("continue_url", "")
             if not next_url:
-                raise RuntimeError(f"注册被拒(status={register_result.get('_status')})")
+                detail = register_result.get("_error") or register_result.get("_body") or ""
+                suffix = f": {detail[:180]}" if detail else ""
+                raise RuntimeError(f"注册被拒(status={register_result.get('_status')}){suffix}")
             return reg_obj, next_url
 
         try:

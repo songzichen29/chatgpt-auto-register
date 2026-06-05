@@ -10,11 +10,29 @@ from pathlib import Path
 
 import openai_bind_email
 import auto_register
+import chatgpt_register
 import phone_sms
 import worker_pool
 
 
 class WorkerPoolComponentTests(unittest.TestCase):
+    def test_validate_otp_uses_plain_contact_verification_post(self):
+        reg = chatgpt_register.ChatGPTRegister(verbose=False)
+        calls = []
+
+        def fake_post(path, payload, **kwargs):
+            calls.append((path, payload, kwargs))
+            return {"continue_url": "/about-you", "_status": 200}
+
+        reg._post_auth_json_with_fallback = fake_post
+        result = reg.validate_otp("123456")
+
+        self.assertEqual(result["continue_url"], "/about-you")
+        self.assertEqual(calls[0][0], "/api/accounts/phone-otp/validate")
+        self.assertEqual(calls[0][1], {"code": "123456"})
+        self.assertIs(calls[0][2]["sentinel"], False)
+        self.assertIs(calls[0][2]["rebuild_on_transport"], False)
+
     def test_auto_register_cancel_with_eta_starts_background_job(self):
         calls = []
 
