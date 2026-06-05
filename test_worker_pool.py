@@ -408,11 +408,12 @@ class WorkerPoolComponentTests(unittest.TestCase):
             router = worker_pool.ThreadStdoutRouter.install_once()
             state = worker_pool.RunState(target_success=1)
             stop = threading.Event()
-            sms_actions = []
+            cancel_jobs = []
 
             old_register_one = worker_pool.ar.register_one
             old_phase2 = worker_pool._run_phase2_with_retry
             old_sms_action = worker_pool._sms_action
+            old_cancel_async = worker_pool._sms_cancel_async
             worker_pool.ar.register_one = lambda *args, **kwargs: {
                 "ok": True,
                 "phone": "+100",
@@ -429,7 +430,8 @@ class WorkerPoolComponentTests(unittest.TestCase):
                     error="exchange-code: 500",
                 )
             worker_pool._run_phase2_with_retry = fake_phase2
-            worker_pool._sms_action = lambda cfg, aid, action: sms_actions.append((aid, action)) or True
+            worker_pool._sms_action = lambda cfg, aid, action: True
+            worker_pool._sms_cancel_async = lambda cfg, aid, phone, reason, log, state_obj: cancel_jobs.append((aid, phone, reason)) or state_obj.record_cancelled()
             try:
                 worker_pool.worker(
                     wid=1,
@@ -450,15 +452,86 @@ class WorkerPoolComponentTests(unittest.TestCase):
                 worker_pool.ar.register_one = old_register_one
                 worker_pool._run_phase2_with_retry = old_phase2
                 worker_pool._sms_action = old_sms_action
+                worker_pool._sms_cancel_async = old_cancel_async
                 router.restore()
 
             snapshot = state.snapshot()
             self.assertEqual(snapshot["full_success"], 0)
             self.assertEqual(snapshot["phase2_failed"], 1)
-            self.assertIn(("aid", "cancel"), sms_actions)
+            self.assertEqual(cancel_jobs, [("aid", "+100", "Phase 2 失败")])
             all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
             self.assertEqual(all_data[-1]["status"], "fail_phase2")
             self.assertEqual(all_data[-1]["password"], "pw")
+
+    def test_worker_phase1_failure_queues_cancel_without_blocking_sms_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "only@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            writer = worker_pool.ResultWriter(tmp_path / "results", tmp_path / "imports")
+            router = worker_pool.ThreadStdoutRouter.install_once()
+            state = worker_pool.RunState(target_success=1)
+            stop = threading.Event()
+            cancel_jobs = []
+
+            old_register_one = worker_pool.ar.register_one
+            old_sms_action = worker_pool._sms_action
+            old_cancel_async = worker_pool._sms_cancel_async
+
+            worker_pool.ar.register_one = lambda *args, **kwargs: {
+                "ok": False,
+                "phone": "+100",
+                "password": "pw",
+                "activation_id": "aid",
+                "error": "验证码超时",
+            }
+
+            def fail_if_blocking_cancel(*_args, **_kwargs):
+                raise AssertionError("_sms_action should not be used for failed cancellation")
+
+            def fake_cancel_async(cfg, activation_id, phone, reason, log, state_obj):
+                cancel_jobs.append((activation_id, phone, reason))
+                state_obj.record_cancelled()
+                stop.set()
+
+            worker_pool._sms_action = fail_if_blocking_cancel
+            worker_pool._sms_cancel_async = fake_cancel_async
+            try:
+                worker_pool.worker(
+                    wid=1,
+                    config={"sub2api": {"url": "u", "email": "e", "pwd": "p"}, "msoutlook": {"helper_url": ""}},
+                    target_count=1,
+                    global_stop=stop,
+                    allocator=allocator,
+                    result_writer=writer,
+                    router=router,
+                    log_lock=threading.Lock(),
+                    state=state,
+                    step_retries=0,
+                    create_retries=1,
+                    cooldown=0,
+                    phase2_timeout=1,
+                )
+            finally:
+                worker_pool.ar.register_one = old_register_one
+                worker_pool._sms_action = old_sms_action
+                worker_pool._sms_cancel_async = old_cancel_async
+                router.restore()
+
+            self.assertEqual(cancel_jobs, [("aid", "+100", "Phase 1 失败")])
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["phase1_failed"], 1)
+            self.assertEqual(snapshot["cancelled"], 1)
+            all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
+            self.assertEqual(all_data[-1]["status"], "fail_phase1")
 
     def test_worker_no_balance_saves_fail_phase1_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -621,11 +694,12 @@ class WorkerPoolComponentTests(unittest.TestCase):
             router = worker_pool.ThreadStdoutRouter.install_once()
             state = worker_pool.RunState(target_success=1)
             stop = threading.Event()
-            sms_actions = []
+            cancel_jobs = []
 
             old_register_one = worker_pool.ar.register_one
             old_phase2 = worker_pool._run_phase2_with_retry
             old_sms_action = worker_pool._sms_action
+            old_cancel_async = worker_pool._sms_cancel_async
             def fake_register_one(*args, **kwargs):
                 stop.set()
                 return {
@@ -638,7 +712,8 @@ class WorkerPoolComponentTests(unittest.TestCase):
                 }
             worker_pool.ar.register_one = fake_register_one
             worker_pool._run_phase2_with_retry = lambda **kwargs: self.fail("Phase 2 should not start after stop")
-            worker_pool._sms_action = lambda cfg, aid, action: sms_actions.append((aid, action)) or True
+            worker_pool._sms_action = lambda cfg, aid, action: True
+            worker_pool._sms_cancel_async = lambda cfg, aid, phone, reason, log, state_obj: cancel_jobs.append((aid, phone, reason)) or state_obj.record_cancelled()
             try:
                 worker_pool.worker(
                     wid=1,
@@ -659,12 +734,13 @@ class WorkerPoolComponentTests(unittest.TestCase):
                 worker_pool.ar.register_one = old_register_one
                 worker_pool._run_phase2_with_retry = old_phase2
                 worker_pool._sms_action = old_sms_action
+                worker_pool._sms_cancel_async = old_cancel_async
                 router.restore()
 
             snapshot = state.snapshot()
             self.assertEqual(snapshot["full_success"], 0)
             self.assertEqual(snapshot["interrupted"], 1)
-            self.assertIn(("aid", "cancel"), sms_actions)
+            self.assertEqual(cancel_jobs, [("aid", "+100", "中断收尾")])
             all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
             self.assertEqual(all_data[-1]["status"], "interrupted_after_phase1")
             self.assertEqual(all_data[-1]["password"], "pw")

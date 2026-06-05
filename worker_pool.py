@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -643,6 +645,52 @@ def _sms_action(cfg: dict, activation_id: str, action: str) -> bool:
     return True
 
 
+def _sms_cancel_async(
+    cfg: dict,
+    activation_id: str,
+    phone: str,
+    reason: str,
+    log,
+    state: RunState,
+) -> None:
+    """Start a detached cancellation job and let the worker continue.
+
+    hero-sms/SmsBower only allow setStatus=8 after a cooldown. Waiting here
+    makes a 30s OTP timeout look like the worker is still "stuck". The helper
+    process keeps retrying independently and records details in logs/.
+    """
+    if not activation_id:
+        return
+    cmd = [
+        sys.executable,
+        str(ROOT / "sms_cancel_once.py"),
+        "--activation-id",
+        str(activation_id),
+        "--config",
+        str(cfg.get("_config_path") or (ROOT / "config.json")),
+        "--phone",
+        str(phone or ""),
+        "--reason",
+        str(reason or ""),
+    ]
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=(os.name != "nt"),
+            start_new_session=(os.name != "nt"),
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
+        )
+    except Exception as exc:
+        log(f"号码取消任务启动失败: {exc}", "error")
+        return
+    state.record_cancelled()
+    log(f"号码取消任务已后台启动: {phone or '?'} ({reason})", "warn")
+
+
 def _account_record(status: str, result: dict, bind_email: str, phase2_error: str = "", sub2api_id: str = "") -> dict:
     return {
         "status": status,
@@ -729,15 +777,7 @@ def worker(
             state.record_phase1_failed()
             phase1_error = result.get("error", "") if result else ""
             log(f"Phase 1 失败: {result.get('phone', '?')} {phase1_error}", "error")
-            if activation_id:
-                try:
-                    if _sms_action(cfg, activation_id, "cancel"):
-                        state.record_cancelled()
-                        log(f"号码已取消: {result.get('phone', '?')}", "warn")
-                    else:
-                        log(f"号码取消未确认: {result.get('phone', '?')}", "error")
-                except Exception as exc:
-                    log(f"号码取消失败: {exc}", "error")
+            _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "Phase 1 失败", log, state)
             result_writer.append_account(_account_record("fail_phase1", result, lease.email))
             lease.release(cooldown)
             if _is_fatal_phase1_error(phase1_error):
@@ -749,14 +789,7 @@ def worker(
         log(f"Phase 1 成功: {result['phone']} -> {lease.email}", "success")
         if global_stop.is_set():
             result_writer.append_account(_account_record("interrupted_after_phase1", result, lease.email))
-            try:
-                if _sms_action(cfg, activation_id, "cancel"):
-                    state.record_cancelled()
-                    log(f"中断收尾，号码已取消: {result.get('phone', '?')}", "warn")
-                else:
-                    log(f"中断收尾，号码取消未确认: {result.get('phone', '?')}", "error")
-            except Exception as exc:
-                log(f"中断收尾取消号码失败: {exc}", "error")
+            _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "中断收尾", log, state)
             lease.release(cooldown)
             state.record_interrupted()
             break
@@ -816,14 +849,7 @@ def worker(
             final_email = outcome.final_email or (active_lease.email if active_lease else "")
             if active_lease and not active_lease.finalized:
                 active_lease.release(cooldown)
-            try:
-                if _sms_action(cfg, activation_id, "cancel"):
-                    state.record_cancelled()
-                    log(f"Phase 2 失败，号码已取消: {result.get('phone', '?')}", "warn")
-                else:
-                    log(f"Phase 2 失败，号码取消未确认: {result.get('phone', '?')}", "error")
-            except Exception as exc:
-                log(f"Phase 2 失败，号码取消失败: {exc}", "error")
+            _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "Phase 2 失败", log, state)
             result_writer.append_account(_account_record("fail_phase2", result, final_email, outcome.error))
             state.record_phase2_failed()
             log(f"Phase 2 失败: {outcome.error}", "error")
@@ -884,6 +910,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     config = ar.load_config(args.config or None)
+    config["_config_path"] = str(Path(args.config).resolve()) if args.config else str(ROOT / "config.json")
     if args.max_price:
         config["max_price"] = args.max_price
 
