@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import importlib.util
 import json
 import os
@@ -80,9 +81,30 @@ def read_json(path: Path, default: Any) -> Any:
 
 def write_json_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        tmp.replace(path)
+    except OSError as exc:
+        # Docker/Linux cannot atomically replace a file that is itself a bind
+        # mount target, which is how config.json is mounted in compose:
+        #   [Errno 16] Device or resource busy: '*.tmp' -> '/app/config.json'
+        # Fall back to truncating the mounted file in place so config saves still
+        # work online, while keeping atomic replace for normal files.
+        if exc.errno not in {errno.EBUSY, errno.EXDEV}:
+            raise
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def parse_int(value: Any, default: int = 0, *, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:

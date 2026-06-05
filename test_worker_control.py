@@ -1,9 +1,11 @@
-﻿import json
+import errno
+import json
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from flask import Flask
 
@@ -143,6 +145,20 @@ class WorkerControlTests(unittest.TestCase):
         r = client.put("/api/config/raw", json={"text": '{"sms_provider":"smsbower"}'})
         self.assertTrue(r.get_json()["ok"])
         self.assertEqual(json.loads((root / "config.json").read_text(encoding="utf-8"))["sms_provider"], "smsbower")
+
+    def test_config_raw_falls_back_when_bind_mount_replace_is_busy(self):
+        tmp, root = self.make_root()
+        self.addCleanup(tmp.cleanup)
+        config = root / "config.json"
+        config.write_text('{"ok": true}\n', encoding="utf-8")
+        app = Flask(__name__)
+        app.register_blueprint(worker_control.create_worker_control_blueprint(root))
+        client = app.test_client()
+        with mock.patch.object(Path, "replace", side_effect=OSError(errno.EBUSY, "Device or resource busy")):
+            r = client.put("/api/config/raw", json={"text": '{"sms_provider":"hero-sms"}'})
+        self.assertTrue(r.get_json()["ok"])
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["sms_provider"], "hero-sms")
+        self.assertEqual(list(root.glob("config.json.*.tmp")), [])
 
     def test_config_form_updates_nested_values_and_helper_bat(self):
         tmp, root = self.make_root()
