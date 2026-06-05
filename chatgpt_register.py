@@ -63,11 +63,13 @@ class ChatGPTRegister:
         self.verbose = verbose
         self.proxy = proxy
         if proxy:
-            import requests as req
-            self.session = req.Session()
+            # 走代理时全部用 requests（代理模式下 Cloudflare 通常不拦截）
+            import requests as _req
+            self.session = _req.Session()
             self.session.proxies = {"http": proxy, "https": proxy}
             self.session.verify = False
         else:
+            # 直连时用 curl_cffi 保持 TLS 指纹
             self.session = curl_requests.Session(impersonate="chrome", verify=False)
 
         self.device_id = str(uuid.uuid4())
@@ -114,7 +116,10 @@ class ChatGPTRegister:
             headers=COMMON_HEADERS,
             timeout=30,
         )
-        csrf = r.json().get("csrfToken")
+        try:
+            csrf = r.json().get("csrfToken")
+        except Exception:
+            csrf = None
         if not csrf:
             raise RuntimeError("CSRF token 获取失败 (可能被 Cloudflare 拦截)")
         return csrf
@@ -131,19 +136,22 @@ class ChatGPTRegister:
             "auth_session_logging_id": str(uuid.uuid4()),
         }
         qs = "&".join(f"{k}={v}" for k, v in params.items())
-        r = self.session.post(
-            f"{CHATGPT}/api/auth/signin/openai?{qs}",
-            data={"callbackUrl": "/", "csrfToken": csrf, "json": "true"},
-            headers={
-                **COMMON_HEADERS,
-                "content-type": "application/x-www-form-urlencoded",
-                "origin": CHATGPT,
-                "referer": f"{CHATGPT}/auth/login",
-            },
-            allow_redirects=False,
-            timeout=30,
-        )
-        return r.json().get("url", "")
+        try:
+            r = self.session.post(
+                f"{CHATGPT}/api/auth/signin/openai?{qs}",
+                data={"callbackUrl": "/", "csrfToken": csrf, "json": "true"},
+                headers={
+                    **COMMON_HEADERS,
+                    "content-type": "application/x-www-form-urlencoded",
+                    "origin": CHATGPT,
+                    "referer": f"{CHATGPT}/auth/login",
+                },
+                allow_redirects=False,
+                timeout=30,
+            )
+            return r.json().get("url", "")
+        except Exception:
+            return ""
 
     # ---- Step 4: 跟随 OAuth 跳转到 auth.openai.com ----
     def jump_to_auth(self, redirect_url: str) -> str:
@@ -156,8 +164,10 @@ class ChatGPTRegister:
         )
         location = r.headers.get("Location", "")
         if location:
+            # 处理相对路径
+            url = location if location.startswith("http") else f"{AUTH}{location}"
             self.session.get(
-                location,
+                url,
                 headers={**NAVIGATE_HEADERS, "referer": AUTH, "sec-fetch-site": "same-origin"},
                 allow_redirects=True,
                 timeout=30,
@@ -177,14 +187,18 @@ class ChatGPTRegister:
         except Exception:
             pass
 
-        r = self.session.post(
-            f"{AUTH}/api/accounts/user/register",
-            json={"username": phone, "password": password},
-            headers=headers,
-            timeout=30,
-        )
-        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-        data["_status"] = r.status_code
+        r = None
+        try:
+            r = self.session.post(
+                f"{AUTH}/api/accounts/user/register",
+                json={"username": phone, "password": password},
+                headers=headers,
+                timeout=30,
+            )
+            data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception:
+            data = {}
+        data["_status"] = r.status_code if r else 0
         return data
 
     # ---- Step 6: 发送手机验证码 ----
@@ -196,6 +210,38 @@ class ChatGPTRegister:
             allow_redirects=True,
             timeout=30,
         )
+
+    def _rebuild_session(self):
+        """重建 session，迁移 Cookie 和配置，解决 curl 55 错误"""
+        # 保存旧 Cookie（含域、路径、安全属性）
+        old_cookies = []
+        try:
+            for cookie in self.session.cookies:
+                old_cookies.append((
+                    cookie.name, cookie.value,
+                    cookie.domain, cookie.path,
+                    cookie.secure, cookie.expires,
+                ))
+        except Exception:
+            pass
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        if self.proxy:
+            self.session = __import__("requests").Session()
+            self.session.proxies = {"http": self.proxy, "https": self.proxy}
+            self.session.verify = False
+        else:
+            self.session = curl_requests.Session(impersonate="chrome", verify=False)
+        # 迁移 Cookie，保留域和路径信息
+        for name, value, domain, path, secure, expires in old_cookies:
+            try:
+                self.session.cookies.set(name, value, domain=domain, path=path, secure=secure)
+            except Exception:
+                pass
+        # 清除 sentinel 缓存，session 重建后旧 token 可能失效
+        self._sentinel_cache.clear()
 
     # ---- Step 7: 验证 OTP 验证码 ----
     def validate_otp(self, code: str) -> dict:
@@ -209,14 +255,20 @@ class ChatGPTRegister:
             self._add_sentinel_headers(headers, "authorize_continue")
         except Exception:
             pass
-        r = self.session.post(
-            f"{AUTH}/api/accounts/phone-otp/validate",
-            json={"code": code},
-            headers=headers,
-            timeout=30,
-        )
-        data = r.json() if r.ok else {}
-        data["_status"] = r.status_code
+        # curl 55 修复: 重建 session 避免复用失效连接
+        self._rebuild_session()
+        r = None
+        try:
+            r = self.session.post(
+                f"{AUTH}/api/accounts/phone-otp/validate",
+                json={"code": code},
+                headers=headers,
+                timeout=30,
+            )
+            data = r.json() if r.ok else {}
+        except Exception:
+            data = {}
+        data["_status"] = r.status_code if r else 0
         return data
 
     # ---- Step 8: 创建账户 (用户名+生日) ----
@@ -231,16 +283,23 @@ class ChatGPTRegister:
             self._add_sentinel_headers(headers, "oauth_create_account")
         except Exception:
             pass
-        r = self.session.post(
-            f"{AUTH}/api/accounts/create_account",
-            json={"name": name, "birthdate": birthdate},
-            headers=headers,
-            allow_redirects=False,
-            timeout=30,
-        )
-        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-        data["_status"] = r.status_code
-        data["_body"] = r.text[:500] if r.text else ""
+        # curl 55 修复: 重建 session 避免复用失效连接
+        self._rebuild_session()
+        r = None
+        try:
+            r = self.session.post(
+                f"{AUTH}/api/accounts/create_account",
+                json={"name": name, "birthdate": birthdate},
+                headers=headers,
+                allow_redirects=False,
+                timeout=30,
+            )
+            ct = r.headers.get("content-type", "")
+            data = r.json() if ct.startswith("application/json") else {}
+        except Exception:
+            data = {}
+        data["_status"] = r.status_code if r else 0
+        data["_body"] = r.text[:500] if r and r.text else ""
         return data
 
     # ---- 访问 about-you 页面建立会话 ----
@@ -258,25 +317,40 @@ class ChatGPTRegister:
     # ---- Step 9: OAuth 回调获取 session token ----
     def oauth_callback(self, callback_url: str) -> str:
         self._log(9, "OAuth 回调 ...")
-        self.session.get(
-            callback_url,
-            headers={**NAVIGATE_HEADERS, "referer": AUTH, "sec-fetch-site": "cross-site"},
-            allow_redirects=True,
-            timeout=30,
-        )
-        return self.session.cookies.get("__Secure-next-auth.session-token", "")
+        try:
+            self.session.get(
+                callback_url,
+                headers={**NAVIGATE_HEADERS, "referer": AUTH, "sec-fetch-site": "cross-site"},
+                allow_redirects=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
+        # 尝试多种 Cookie 名称，兼容服务端变更
+        for name in [
+            "__Secure-next-auth.session-token",
+            "__Secure-next-auth.session-token.1",
+            "next-auth.session-token",
+        ]:
+            token = self.session.cookies.get(name, "")
+            if token:
+                return token
+        return ""
 
     # ---- 获取 access token ----
     def get_access_token(self) -> str:
-        r = self.session.get(
-            f"{CHATGPT}/api/auth/session",
-            headers=COMMON_HEADERS,
-            timeout=30,
-        )
         try:
-            return r.json().get("accessToken", "")
+            r = self.session.get(
+                f"{CHATGPT}/api/auth/session",
+                headers=COMMON_HEADERS,
+                timeout=30,
+            )
+            body = r.json()
+            if isinstance(body, dict):
+                return body.get("accessToken", "")
         except Exception:
-            return ""
+            pass
+        return ""
 
 
 def register_phone_account(
@@ -287,7 +361,6 @@ def register_phone_account(
     name: str = "A",
     birthdate: str = "2000-01-01",
     verbose: bool = True,
-    create_account_retries: int = 1,
 ) -> dict:
     """One-shot phone registration: gets number -> session_token + access_token."""
     import json
@@ -296,6 +369,8 @@ def register_phone_account(
         reg.visit()
         csrf = reg.get_csrf()
         redirect = reg.signin(phone, csrf)
+        if not redirect:
+            return {"ok": False, "phone": phone, "error": "signin 无返回(可能被 Cloudflare 拦截)"}
         reg.jump_to_auth(redirect)
         result = reg.register_user(phone, password)
         continue_url = result.get("continue_url", "")

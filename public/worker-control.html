@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>worker_pool 控制台</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f0e8;color:#4a3728;font-family:"Microsoft YaHei","PingFang SC",sans-serif;font-size:13px}.layout{display:grid;grid-template-columns:300px 1fr;min-height:100vh}.side{background:#fff;border-right:1px solid #e0d5c5;padding:16px;overflow:auto}.main{padding:18px;overflow:auto}.brand{font-size:17px;font-weight:700;color:#6b4226;margin-bottom:14px}.section{background:#fff;border:1px solid #e8d5b0;border-radius:8px;margin-bottom:14px;padding:14px}.section h2{font-size:15px;margin:0 0 12px;color:#6b4226}.grid{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;margin-bottom:14px}.metric{background:#fff;border:1px solid #e8d5b0;border-radius:8px;padding:12px}.metric b{display:block;font-size:22px;color:#6b4226}.metric span{color:#8b6f4e;font-size:12px}label{display:block;margin:8px 0 3px;color:#8b6f4e;font-size:12px}input,select,textarea{width:100%;border:1px solid #d4b896;background:#fffbf5;border-radius:4px;color:#4a3728;padding:7px 8px;font-size:13px}textarea{font-family:Consolas,"Microsoft YaHei",monospace;resize:vertical}input:focus,select:focus,textarea:focus{outline:none;border-color:#c4820e}button{border:1px solid #d4b896;background:#f0e4d0;color:#4a3728;border-radius:4px;padding:7px 10px;cursor:pointer;font-size:12px}button.primary{background:#c4820e;border-color:#c4820e;color:#fff}button.danger{background:#c62828;border-color:#c62828;color:#fff}button:disabled{opacity:.55;cursor:not-allowed}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.toolbar input,.toolbar select{width:auto;min-width:120px}.tabs{display:flex;gap:6px;margin-bottom:12px}.tab{background:#fff}.tab.active{background:#6b4226;border-color:#6b4226;color:#fff}.panel{display:none}.panel.active{display:block}table{width:100%;border-collapse:collapse;background:#fff;font-size:12px}th,td{border-bottom:1px solid #eadcc8;padding:7px 8px;text-align:left;vertical-align:top}th{color:#8b6f4e;font-weight:600;background:#fffbf5;position:sticky;top:0}.table-wrap{max-height:540px;overflow:auto;border:1px solid #e8d5b0;border-radius:6px}.log{height:430px;overflow:auto;background:#1f1f1f;color:#ddd;border-radius:6px;padding:10px;font:12px/1.5 Consolas,monospace}.log .error{color:#ff7777}.log .warn{color:#ffb15c}.log .success{color:#72d488}.muted{color:#8b6f4e}.status{font-size:12px;color:#8b6f4e}.pill{display:inline-block;border:1px solid #d4b896;border-radius:4px;padding:1px 5px;background:#fffbf5}.copyable{cursor:pointer;color:#6b4226;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:10px}.pager select{width:auto}.toast{position:fixed;right:14px;top:14px;background:#fff;border:1px solid #d4b896;border-radius:6px;padding:9px 12px;display:none;z-index:20}.toast.ok{border-color:#2e7d32;color:#2e7d32}.toast.err{border-color:#c62828;color:#c62828}@media(max-width:900px){.layout{grid-template-columns:1fr}.grid{grid-template-columns:repeat(2,1fr)}.toolbar input,.toolbar select{width:100%}}
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="side">
+    <div class="brand">worker_pool 控制台</div>
+    <div class="section">
+      <h2>运行</h2>
+      <label>目标数量</label><input id="run-count" type="number" value="1" min="1">
+      <label>并发数</label><input id="run-concurrency" type="number" value="1" min="1" max="10">
+      <label>步骤重试</label><input id="run-retry" type="number" value="2" min="0">
+      <label>创建重试</label><input id="run-create-retry" type="number" value="20" min="1">
+      <label>Phase2 超时秒</label><input id="run-phase2-timeout" type="number" value="300" min="1">
+      <label>冷却秒</label><input id="run-cooldown" type="number" value="60" min="0">
+      <div class="row" style="margin-top:10px"><button class="primary" id="btn-start" onclick="startWorker()">开始</button><button class="danger" id="btn-stop" onclick="stopWorker()">停止</button></div>
+      <div class="status" id="run-status">就绪</div>
+    </div>
+    <div class="section">
+      <h2>配置</h2>
+      <button onclick="showTab('config',document.querySelector('[data-tab=config]'))">打开配置表单</button>
+      <button onclick="loadConfigForm()">重新加载</button>
+      <div class="status" id="config-status"></div>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="grid">
+      <div class="metric"><b id="m-pool-total">0</b><span>邮箱池总量</span></div>
+      <div class="metric"><b id="m-pool-import">0</b><span>已导入账号</span></div>
+      <div class="metric"><b id="m-ok">0</b><span>注册成功</span></div>
+      <div class="metric"><b id="m-fail">0</b><span>注册失败</span></div>
+      <div class="metric"><b id="m-trial">0</b><span>成功试用</span></div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="accounts" onclick="showTab('accounts',this)">成功账号</button>
+      <button class="tab" data-tab="failed" onclick="showTab('failed',this)">失败记录</button>
+      <button class="tab" data-tab="pool" onclick="showTab('pool',this)">号池</button>
+      <button class="tab" data-tab="config" onclick="showTab('config',this)">配置</button>
+      <button class="tab" data-tab="helper" onclick="showTab('helper',this)">收码服务</button>
+      <button class="tab" data-tab="logs" onclick="showTab('logs',this)">日志</button>
+    </div>
+
+    <section class="panel active" id="panel-accounts">
+      <div class="section">
+        <h2>成功账号</h2>
+        <div class="toolbar">
+          <select id="f-export"><option value="">全部导出状态</option><option value="not_exported">未导出</option><option value="exported">已导出</option><option value="ignored">不导出</option></select>
+          <select id="f-exportable"><option value="">可导出?</option><option value="1">可导出</option><option value="0">不可导出</option></select>
+          <select id="acc-sort"><option value="saved_at">按时间</option><option value="export_status">按导出状态</option><option value="bind_email">按邮箱</option><option value="phone">按手机号</option><option value="sub2api_id">按 SUB</option></select>
+          <select id="acc-order"><option value="desc">倒序</option><option value="asc">正序</option></select>
+          <input id="f-q" placeholder="搜索手机号/邮箱/SUB">
+          <button onclick="loadAccounts()">查询</button>
+        </div>
+        <div class="toolbar">
+          <button onclick="selectPage(true)">全选当前页</button><button onclick="selectPage(false)">取消当前页</button><button onclick="selectFiltered()">选择当前筛选全部</button><span id="select-info" class="muted">未选择</span>
+          <select id="batch-export"><option value="">改导出状态</option><option value="not_exported">未导出</option><option value="exported">已导出</option><option value="ignored">不导出</option></select>
+          <button onclick="batchState()">批量修改</button><button onclick="exportSub()">导出 SUB</button>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th></th><th>手机号</th><th>邮箱</th><th>导出状态</th><th>SUB</th><th>可导出</th><th>时间</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+        <div class="pager"><button onclick="prevPage('acc',loadAccounts)">上一页</button><span id="acc-page-info" class="muted"></span><button onclick="nextPage('acc',loadAccounts)">下一页</button><select id="acc-limit" onchange="goPage('acc',1);loadAccounts()"><option>50</option><option selected>100</option><option>200</option><option>500</option></select></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-failed">
+      <div class="section">
+        <h2>失败记录</h2>
+        <div class="toolbar">
+          <select id="fail-reg"><option value="">全部失败</option><option value="fail_phase1">Phase1失败</option><option value="fail_phase2">Phase2失败</option><option value="interrupted_after_phase1">Phase1后中断</option><option value="fail">失败</option></select>
+          <select id="fail-sort"><option value="saved_at">按时间</option><option value="reg_status">按失败阶段</option><option value="phone">按手机号</option><option value="bind_email">按邮箱</option></select>
+          <select id="fail-order"><option value="desc">倒序</option><option value="asc">正序</option></select>
+          <input id="fail-q" placeholder="搜索手机号/邮箱/错误">
+          <button onclick="goPage('fail',1);loadFailed()">查询</button>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>手机号</th><th>邮箱</th><th>失败阶段</th><th>建议</th><th>错误</th><th>时间</th><th>操作</th></tr></thead><tbody id="failed-body"></tbody></table></div>
+        <div class="pager"><button onclick="prevPage('fail',loadFailed)">上一页</button><span id="fail-page-info" class="muted"></span><button onclick="nextPage('fail',loadFailed)">下一页</button><select id="fail-limit" onchange="goPage('fail',1);loadFailed()"><option>50</option><option selected>100</option><option>200</option><option>500</option></select></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-pool">
+      <div class="section">
+        <h2>邮箱号池</h2>
+        <label>导入号池，每行：email----password----id----refreshToken</label>
+        <textarea id="pool-import-text" rows="5"></textarea>
+        <div class="toolbar"><button class="primary" onclick="importPool()">导入号池</button><select id="pool-status"><option value="">全部状态</option><option value="unused">未使用</option><option value="used">已用</option><option value="error">错误</option><option value="reserved">占用中</option><option value="disabled">禁用</option></select><select id="pool-sort"><option value="status">按状态</option><option value="email">按邮箱</option><option value="used_at">按时间</option></select><select id="pool-order"><option value="asc">正序</option><option value="desc">倒序</option></select><input id="pool-q" placeholder="搜索邮箱/手机号/错误"><button onclick="goPage('pool',1);loadPool()">查询号池</button></div>
+        <div class="status" id="pool-stats"></div>
+        <div class="table-wrap"><table><thead><tr><th>邮箱</th><th>状态</th><th>手机号</th><th>错误</th><th>时间</th></tr></thead><tbody id="pool-body"></tbody></table></div>
+        <div class="pager"><button onclick="prevPage('pool',loadPool)">上一页</button><span id="pool-page-info" class="muted"></span><button onclick="nextPage('pool',loadPool)">下一页</button><select id="pool-limit" onchange="goPage('pool',1);loadPool()"><option>50</option><option selected>100</option><option>200</option><option>500</option></select></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-config">
+      <div class="section">
+        <h2>配置表单</h2>
+        <div class="row"><label>短信平台<select id="cfg.sms_provider"><option value="smsbower">smsbower</option><option value="hero-sms">hero-sms</option><option value="fivesim">fivesim</option></select></label><label>国家<input id="cfg.country"></label><label>服务<input id="cfg.service"></label></div>
+        <div class="row"><label>注册密码<input id="cfg.register.password"></label><label>姓名<input id="cfg.register.name"></label><label>生日<input id="cfg.register.birthdate" placeholder="2000-01-01"></label></div>
+        <div class="row"><label>代理<input id="cfg.proxy"></label><label>短信超时秒<input id="cfg.sms_timeout" type="number" min="0"></label><label>验证码超时秒<input id="cfg.code_timeout" type="number" min="0"></label></div>
+        <div class="row"><label>最高价格<input id="cfg.max_price"></label><label>绑定邮箱<input id="cfg.bind_email"></label></div>
+        <h2>SUB2API</h2>
+        <div class="row"><label>URL<input id="cfg.sub2api.url"></label><label>邮箱<input id="cfg.sub2api.email"></label><label>密码<input id="cfg.sub2api.pwd"></label></div>
+        <div class="row"><label>分组<input id="cfg.sub2api.group"></label><label>代理 ID<input id="cfg.sub2api.proxy_id" type="number" min="0"></label></div>
+        <h2>其他 Key</h2>
+        <div class="row"><label>hero_sms api_key<input id="cfg.hero_sms.api_key"></label><label>hero_sms base_url<input id="cfg.hero_sms.base_url"></label></div>
+        <div class="row"><label>smsbower api_key<input id="cfg.smsbower.api_key"></label><label>fivesim api_key<input id="cfg.fivesim.api_key"></label></div>
+        <div class="row"><label>icloud user<input id="cfg.icloud.user"></label><label>icloud pass<input id="cfg.icloud.pass"></label></div>
+        <div class="toolbar"><button class="primary" onclick="saveConfigForm()">保存配置</button><button onclick="loadConfigForm()">重新加载</button></div>
+        <div class="status" id="config-form-status"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-helper">
+      <div class="section">
+        <h2>邮箱验证码服务</h2>
+        <div class="row"><label>模式<select id="helper-mode"><option value="direct">直连接码 API</option><option value="http">HTTP Helper</option></select></label><label>Helper URL<input id="helper-url"></label></div>
+        <label>hotmail_helper.py 路径<input id="helper-script"></label>
+        <div class="toolbar"><button onclick="checkHelper()">检查连接</button><button class="primary" onclick="saveHelperConfig()">保存收码配置</button><span class="status" id="helper-status"></span></div>
+        <div class="row"><label>测试邮箱<input id="helper-email"></label><label>关键字<input id="helper-keyword" value="openai"></label><label>邮件数量<input id="helper-top" type="number" value="5" min="1" max="30"></label></div>
+        <div class="toolbar"><button onclick="testCode()">获取验证码</button><button onclick="loadMessages()">查看最近邮件</button><span class="status" id="helper-code"></span></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>发件人</th><th>主题</th><th>预览</th></tr></thead><tbody id="helper-messages"></tbody></table></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-logs">
+      <div class="section">
+        <h2>实时日志</h2>
+        <div class="toolbar"><button onclick="setLogStream('')">全部</button><span id="log-streams"></span></div>
+        <div class="log" id="log"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var selected=new Set(), filteredSelected=false, currentAccounts=[], logCursor=0, activeStream='';
+var pages={acc:{page:1,pages:1},fail:{page:1,pages:1},pool:{page:1,pages:1}};
+function G(id){return document.getElementById(id)}
+function toast(msg,ok){var t=G('toast');t.textContent=msg;t.className='toast '+(ok?'ok':'err');t.style.display='block';setTimeout(function(){t.style.display='none'},2500)}
+function showTab(name,btn){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));G('panel-'+name).classList.add('active');if(btn)btn.classList.add('active');if(name==='accounts')loadAccounts();if(name==='failed')loadFailed();if(name==='pool')loadPool();if(name==='config')loadConfigForm();if(name==='helper')loadHelperDefaults();if(name==='logs')loadLogStreams()}
+function goPage(name,page){pages[name].page=Math.max(1,page)}
+function prevPage(name,fn){if(pages[name].page>1){pages[name].page--;fn()}}
+function nextPage(name,fn){if(pages[name].page<pages[name].pages){pages[name].page++;fn()}}
+function pageParams(name,limitId){var limit=parseInt(G(limitId).value||100,10),page=pages[name].page||1;return {limit:limit,offset:(page-1)*limit}}
+function setPageInfo(name,j,id){pages[name].page=j.page||1;pages[name].pages=j.pages||1;G(id).textContent='第 '+pages[name].page+' / '+pages[name].pages+' 页，共 '+(j.total||0)+' 条'}
+function accountFilters(){return {...pageParams('acc','acc-limit'),success_only:1,export_status:G('f-export').value,exportable:G('f-exportable').value,q:G('f-q').value,sort:G('acc-sort').value,order:G('acc-order').value}}
+function failedFilters(){return {...pageParams('fail','fail-limit'),failed_only:1,reg_status:G('fail-reg').value,q:G('fail-q').value,sort:G('fail-sort').value,order:G('fail-order').value}}
+function scopePayload(){return filteredSelected?{scope:'filtered',keys:[],filters:accountFilters()}:{scope:'selected',keys:Array.from(selected),filters:{}}}
+function updateSelectInfo(){G('select-info').textContent=filteredSelected?'已选择当前筛选全部':'已选择 '+selected.size+' 个'}
+function loadSummary(){fetch('/api/dashboard/summary').then(r=>r.json()).then(j=>{if(!j.ok)return;G('m-pool-total').textContent=j.pool.total||0;G('m-pool-import').textContent=j.pool.import_added_total||0;G('m-ok').textContent=j.accounts.registered_success||0;G('m-fail').textContent=j.accounts.registered_failed||0;G('m-trial').textContent=j.accounts.trial_success||0})}
+function zhStatus(v,type){var m={ok:'成功',fail:'失败',fail_phase1:'Phase1失败',fail_phase2:'Phase2失败',interrupted_after_phase1:'Phase1后中断',unknown:'未知',unused:'未使用',testing:'测试中',used:'已使用',bad:'不可用',reserved:'占用中',not_exported:'未导出',exported:'已导出',ignored:'不导出',disabled:'禁用',error:'错误',full:'完整重跑',phase2:'续跑Phase2',export:'重导出',main:'主日志',retry:'重试'};return m[v]||v||'-'}
+function copyCell(value,label){value=String(value||'').trim();if(!value||value==='-')return;function done(){toast((label||'内容')+'已复制',true)}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(value).then(done).catch(function(){fallbackCopy(value);done()})}else{fallbackCopy(value);done()}}
+function fallbackCopy(value){var ta=document.createElement('textarea');ta.value=value;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta)}
+function cp(value,label){return value?'<span class="copyable" title="点击复制" data-copy="'+esc(value)+'" data-label="'+esc(label||'内容')+'">'+esc(value)+'</span>':'-'}
+document.addEventListener('click',function(e){var el=e.target.closest?e.target.closest('.copyable'):null;if(!el)return;copyCell(el.dataset.copy||'',el.dataset.label||'内容')})
+function loadAccounts(){var qs=new URLSearchParams(accountFilters());fetch('/api/accounts?'+qs).then(r=>r.json()).then(j=>{currentAccounts=j.items||[];var h='';currentAccounts.forEach(a=>{var checked=selected.has(a.key)?'checked':'';var exportText=zhStatus(a.export_status);if(!a.exportable&&!a.sub2api_id_present)exportText+=' /不可导出';h+='<tr><td><input type="checkbox" data-key="'+esc(a.key)+'" '+checked+' onchange="toggleKey(this)"></td><td>'+cp(a.phone,'手机号')+'</td><td>'+cp(a.bind_email,'邮箱')+'</td><td><span class=pill>'+esc(exportText)+'</span></td><td>'+esc(a.sub2api_id||'-')+'</td><td>'+esc(a.exportable?'是':(a.sub2api_id_present?'已有ID':'否'))+'</td><td>'+esc((a.saved_at||'').slice(0,19))+'</td></tr>'});G('accounts-body').innerHTML=h;setPageInfo('acc',j,'acc-page-info');updateSelectInfo();loadSummary()})}
+function loadFailed(){var qs=new URLSearchParams(failedFilters());fetch('/api/accounts/failed?'+qs).then(r=>r.json()).then(j=>{var h='';(j.items||[]).forEach(a=>{var err=(a.phase2_error||a.error||'').slice(0,120);var retry=a.retry&&a.retry.retryable?zhStatus(a.retry.recommended_stage):(a.retry&&a.retry.reason?a.retry.reason:'不可重试');var btn=a.retry&&a.retry.retryable?'<button onclick="retryOne(\''+escJs(a.key)+'\')">重试</button>':'-';h+='<tr><td>'+cp(a.phone,'手机号')+'</td><td>'+cp(a.bind_email,'邮箱')+'</td><td>'+esc(zhStatus(a.reg_status))+'</td><td>'+esc(retry)+'</td><td title="'+esc(err)+'">'+esc(err||'-')+'</td><td>'+esc((a.saved_at||'').slice(0,19))+'</td><td>'+btn+'</td></tr>'});G('failed-body').innerHTML=h;setPageInfo('fail',j,'fail-page-info');loadSummary()})}
+function toggleKey(cb){filteredSelected=false;if(cb.checked)selected.add(cb.dataset.key);else selected.delete(cb.dataset.key);updateSelectInfo()}
+function selectPage(on){filteredSelected=false;currentAccounts.forEach(a=>on?selected.add(a.key):selected.delete(a.key));loadAccounts();updateSelectInfo()}
+function selectFiltered(){filteredSelected=true;selected.clear();updateSelectInfo()}
+function batchState(){var p=scopePayload(), patch={};if(G('batch-export').value)patch.export_status=G('batch-export').value;if(!Object.keys(patch).length){toast('请选择要修改的导出状态',false);return}fetch('/api/accounts/batch-state',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({...p,patch:patch})}).then(r=>r.json()).then(j=>{toast(j.ok?'已修改 '+j.updated+' 个':j.error,j.ok);loadAccounts();loadSummary()})}
+function exportSub(){var p=scopePayload();fetch('/api/export/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...p,mark_exported:true})}).then(async r=>{if((r.headers.get('content-type')||'').includes('application/json')){var j=await r.json();toast(j.error||'导出失败',false);return}var blob=await r.blob();var url=URL.createObjectURL(blob);var a=document.createElement('a');a.href=url;a.download='sub2api_export.json';a.click();URL.revokeObjectURL(url);toast('导出完成',true);loadAccounts();loadSummary()})}
+function retryOne(key){fetch('/api/retry/'+encodeURIComponent(key)+'/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stage:'auto',options:{concurrency:1,max_items:1}})}).then(r=>r.json()).then(j=>toast(j.ok?'重试任务已启动':j.error,j.ok))}
+function loadPool(){var p={...pageParams('pool','pool-limit'),status:G('pool-status').value,q:G('pool-q').value,sort:G('pool-sort').value,order:G('pool-order').value};var qs=new URLSearchParams(p);fetch('/api/pool/accounts?'+qs).then(r=>r.json()).then(j=>{if(!j.ok)return;G('pool-stats').textContent='总量 '+j.stats.total+' 可用 '+j.stats.unused+' 已用 '+j.stats.used+' 错误 '+j.stats.error+' 占用 '+j.stats.reserved;G('pool-body').innerHTML=(j.items||[]).map(x=>'<tr><td>'+cp(x.email,'邮箱')+'</td><td>'+esc(zhStatus(x.status))+'</td><td>'+cp(x.phone||'','手机号')+'</td><td>'+esc(x.error||'-')+'</td><td>'+esc((x.used_at||'').slice(0,19))+'</td></tr>').join('');setPageInfo('pool',j,'pool-page-info')})}
+function importPool(){var text=G('pool-import-text').value.trim();if(!text){toast('请粘贴号池内容',false);return}fetch('/api/pool/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text})}).then(r=>r.json()).then(j=>{toast(j.ok?'新增 '+j.added+' 跳过 '+j.skipped:j.error,j.ok);if(j.ok)G('pool-import-text').value='';loadPool();loadSummary()})}
+function loadConfigRaw(){fetch('/api/config/raw').then(r=>r.json()).then(j=>{G('config-status').textContent='已加载 '+(j.path||'config.json')})}
+function cfgIds(){return ['sms_provider','smsbower.api_key','hero_sms.api_key','hero_sms.base_url','fivesim.api_key','register.password','register.name','register.birthdate','proxy','country','service','max_price','sms_timeout','code_timeout','icloud.user','icloud.pass','sub2api.url','sub2api.email','sub2api.pwd','sub2api.group','sub2api.proxy_id','bind_email','msoutlook.helper_mode','msoutlook.helper_url','msoutlook.email','msoutlook.helper_script','msoutlook.helper_bat']}
+function loadConfigForm(){fetch('/api/config/form').then(r=>r.json()).then(j=>{if(!j.ok){toast(j.error,false);return}cfgIds().forEach(k=>{var el=G('cfg.'+k);if(el)el.value=j.values[k]||''});var msg='已加载 '+(j.path||'config.json');G('config-form-status').textContent=msg;G('config-status').textContent=msg;loadHelperDefaultsFromValues(j.values)})}
+function saveConfigForm(){var values={};cfgIds().forEach(k=>{var el=G('cfg.'+k);if(el)values[k]=el.value});fetch('/api/config/form',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({values:values})}).then(r=>r.json()).then(j=>{toast(j.ok?'配置已保存':j.error,j.ok);if(j.ok){G('config-form-status').textContent='保存成功';G('config-status').textContent='配置已保存';loadHelperDefaultsFromValues(j.values)}})}
+function saveHelperConfig(){var values={'msoutlook.helper_mode':G('helper-mode').value,'msoutlook.helper_url':G('helper-url').value,'msoutlook.email':G('helper-email').value,'msoutlook.helper_script':G('helper-script').value};fetch('/api/config/form',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({values:values})}).then(r=>r.json()).then(j=>{toast(j.ok?'收码配置已保存':j.error,j.ok);if(j.ok)loadHelperDefaultsFromValues(j.values)})}
+function startWorker(){var d={count:G('run-count').value,concurrency:G('run-concurrency').value,retry:G('run-retry').value,create_retry:G('run-create-retry').value,phase2_timeout:G('run-phase2-timeout').value,cooldown:G('run-cooldown').value};fetch('/api/worker/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(j=>toast(j.ok?'已启动':j.error,j.ok))}
+function stopWorker(){fetch('/api/worker/stop',{method:'POST'}).then(r=>r.json()).then(j=>toast(j.ok?'正在停止':j.error,j.ok))}
+function pollStatus(){fetch('/api/worker/status').then(r=>r.json()).then(j=>{G('run-status').textContent=j.running?'运行中 pid='+j.pid:(j.exit_code!=null?'已结束 code='+j.exit_code:'就绪');G('btn-start').disabled=j.running;G('btn-stop').disabled=!j.running;if(j.running)loadLogStreams()})}
+function setLogStream(s){activeStream=s;logCursor=0;G('log').innerHTML='';pollLog()}
+function loadLogStreams(){fetch('/api/worker/log-streams').then(r=>r.json()).then(j=>{var box=G('log-streams');box.innerHTML='';(j.streams||[]).forEach(x=>{var b=document.createElement('button');b.textContent=x.stream+' ('+x.count+')';b.onclick=function(){setLogStream(x.stream)};box.appendChild(b);var w=document.createElement('button');w.textContent=x.stream+' 窗口';w.onclick=function(){openLogWindow(x.stream)};box.appendChild(w)})})}
+function pollLog(){var url='/api/worker/log-since/'+logCursor+(activeStream?'?stream='+encodeURIComponent(activeStream):'');fetch(url).then(r=>r.json()).then(j=>{logCursor=j.cursor;var box=G('log');(j.lines||[]).forEach(l=>{var d=document.createElement('div');d.className=l.tag;d.textContent=l.time+' ['+(l.stream||'main')+'] '+l.text;box.appendChild(d)});if((j.lines||[]).length)box.scrollTop=box.scrollHeight})}
+function openLogWindow(stream){var w=window.open('','worker_log_'+stream,'width=960,height=620');if(!w){toast('窗口被浏览器拦截',false);return}w.document.write('<!doctype html><meta charset="utf-8"><title>'+esc(stream)+' 日志</title><style>body{margin:0;background:#1f1f1f;color:#ddd;font:12px/1.5 Consolas,monospace}#bar{position:sticky;top:0;background:#111;padding:8px;color:#fff}#log{padding:10px}.error{color:#ff7777}.warn{color:#ffb15c}.success{color:#72d488}</style><div id="bar">'+esc(stream)+' 日志</div><div id="log"></div>');w.document.close();var cursor=0;var timer=setInterval(function(){if(w.closed){clearInterval(timer);return}fetch('/api/worker/log-since/'+cursor+'?stream='+encodeURIComponent(stream)).then(r=>r.json()).then(j=>{cursor=j.cursor;var box=w.document.getElementById('log');(j.lines||[]).forEach(l=>{var d=w.document.createElement('div');d.className=l.tag;d.textContent=l.time+' '+l.text;box.appendChild(d)});if((j.lines||[]).length)w.scrollTo(0,w.document.body.scrollHeight)})},1000)}
+function loadHelperDefaultsFromValues(v){if(!v)return;G('helper-mode').value=v['msoutlook.helper_mode']||'direct';G('helper-url').value=v['msoutlook.helper_url']||'http://127.0.0.1:17373';G('helper-email').value=v['msoutlook.email']||'';G('helper-script').value=v['msoutlook.helper_script']||''}
+function loadHelperDefaults(){fetch('/api/config/form').then(r=>r.json()).then(j=>{if(j.ok)loadHelperDefaultsFromValues(j.values)})}
+function checkHelper(){var qs=new URLSearchParams({mode:G('helper-mode').value,url:G('helper-url').value,script:G('helper-script').value});fetch('/api/helper/status?'+qs).then(r=>r.json()).then(j=>{var msg=j.mode==='direct'?(j.reachable?'直连接码 API 可用 '+(j.api_base||''):'直连接码 API 不可用 '+(j.error||'')):(j.reachable?'HTTP Helper 可连接 '+j.url:'HTTP Helper 不可连接 '+(j.error||''));G('helper-status').textContent=msg;toast(msg,!!j.reachable)})}
+function helperPayload(){return {mode:G('helper-mode').value,helper_url:G('helper-url').value,helper_script:G('helper-script').value,email:G('helper-email').value,keyword:G('helper-keyword').value,top:G('helper-top').value}}
+function testCode(){fetch('/api/helper/code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(helperPayload())}).then(r=>r.json()).then(j=>{G('helper-code').textContent=j.ok?(j.code?'验证码 '+j.code:j.message):j.error;toast(j.ok?(j.code?'找到验证码':'未找到验证码'):j.error,j.ok)})}
+function loadMessages(){fetch('/api/helper/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(helperPayload())}).then(r=>r.json()).then(j=>{if(!j.ok){toast(j.error,false);return}var rows=(j.result.messages||[]).map(m=>{var from=(m.from&&m.from.emailAddress)?m.from.emailAddress.address:'';return '<tr><td>'+esc(m.receivedDateTime||m.receivedTimestamp||'')+'</td><td>'+esc(from)+'</td><td>'+esc(m.subject||'')+'</td><td>'+esc(m.bodyPreview||'')+'</td></tr>'});G('helper-messages').innerHTML=rows.join('');toast('读取邮件 '+rows.length+' 封',true)})}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function escJs(s){return String(s==null?'':s).replace(/[\\']/g,c=>({'\\':'\\\\',"'":"\\'"}[c]))}
+setInterval(pollStatus,1500);setInterval(pollLog,1000);loadSummary();loadAccounts();loadConfigForm();
+</script>
+</body>
+</html>

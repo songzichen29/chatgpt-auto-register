@@ -1,0 +1,76 @@
+feature: 2026-06-03-concurrent-register
+created: 2026-06-03
+status: approved
+
+steps:
+  - action: "兼容 Phase 2 基础函数：修改 openai_bind_email.run_second_half() 的 save_import、interactive_input 与 exchange-code 重试"
+    exit_signal: "旧调用方不传新参数仍可运行；worker_pool 可传 save_import=False, interactive_input=False 并拿到 import_data"
+    status: done
+  - action: "搭建 worker_pool CLI 骨架：实现参数解析、配置加载、preflight、ThreadStdoutRouter.install_once()"
+    exit_signal: "python worker_pool.py --help 可运行；-c 8 会报错退出"
+    status: done
+  - action: "实现邮箱租约：实现 EmailAllocator / EmailLease / 冷却释放"
+    exit_signal: "两个线程同时 acquire 不会拿到同一邮箱；release 后冷却期内不可再次 acquire"
+    status: done
+  - action: "实现结果写入器：实现 ResultWriter.append_account() 与 append_import()"
+    exit_signal: "多线程并发写 _all.json 和 imports/import_YYYYMMDD.json 不丢记录、不重复写同一条"
+    status: done
+  - action: "实现 Phase 2 重试编排：实现 SUB2API 登录、OAuth URL 生成、Phase2Outcome、换邮箱和 300s 总耗时"
+    exit_signal: "stub 出 email_already_in_use 时旧 lease error、新 lease 生效；stub 出 exchange-code 500 时会重跑 OAuth"
+    status: done
+  - action: "实现 worker loop 与 Ctrl+C draining：完整接通 Phase 1 → Phase 2 → complete/cancel → result writer"
+    exit_signal: "Phase 1 成功但 Phase 2 失败会保存 fail_phase2 且不增加 full success；Ctrl+C 后不再创建新尝试"
+    status: done
+  - action: "执行最小验证与清理：运行组件级测试/脚本和手工 -c 1、-c 2、Ctrl+C 验收"
+    exit_signal: "所有检查项有明确 pass/fail 结果，未通过项不进入实现完成汇报"
+    status: done
+
+checks:
+  - item: "不改造 web_gui.py、runner.py、server.py 的编排行为"
+    source: 范围守护
+    status: passed
+  - item: "worker_pool.py 不使用线程内 contextlib.redirect_stdout"
+    source: 接口契约
+    status: passed
+  - item: "--count/-n 只统计完整成功：Phase 1 成功 + Phase 2 成功 + complete + 保存结果"
+    source: 接口契约
+    status: passed
+  - item: "concurrency 默认 1、推荐 2-3、硬上限 10，超过 10 报错退出"
+    source: 接口契约
+    status: passed
+  - item: "Phase 1 成功但 Phase 2 失败保存 status=fail_phase2，且不增加 full_success"
+    source: 接口契约
+    status: passed
+  - item: "Phase 2 换邮箱后，旧 lease mark_error，新 lease 成为唯一 active lease，最终 mark/release 不再使用旧 bind_email"
+    source: 接口契约
+    status: passed
+  - item: "run_second_half(save_import=False) 不直接写 imports，只返回 import_data 给 ResultWriter"
+    source: 接口契约
+    status: passed
+  - item: "worker_pool 调用 run_second_half(interactive_input=False)，绑定验证码自动轮询超时时不阻塞等待 input()"
+    source: 接口契约
+    status: passed
+  - item: "exchange-code 对 RequestException 和 429/500/502/503/504 重试，400 等非重试错误立即返回"
+    source: 接口契约
+    status: passed
+  - item: "Ctrl+C 后停止新尝试，未进入 Phase 2 的 Phase 1 成功账号 cancel，已进入 Phase 2 的账号按结果 complete/cancel"
+    source: 接口契约
+    status: passed
+  - item: "ResultWriter 并发写 results/_all.json 和 imports/import_YYYYMMDD.json 不丢数据"
+    source: 测试约束
+    status: passed
+  - item: "EmailAllocator.acquire() 多线程无重复邮箱，release 后冷却期内不可再次获取"
+    source: 测试约束
+    status: passed
+  - item: "结果文件不写入 access_token、API key、SUB2API 密码、Cookie"
+    source: 范围守护
+    status: passed
+  - item: "worker_pool 读取 config.json 的 register.password；结果文件成功/失败状态都保留注册账号 password"
+    source: 接口契约
+    status: passed
+  - item: "msoutlook_used.json 的 used/error 邮箱记录保留绑定手机号和注册账号 password"
+    source: 接口契约
+    status: passed
+  - item: "缺少 SUB2API 或 MsOutlook 配置时 preflight 失败，不进入 Phase 1"
+    source: 接口契约
+    status: passed

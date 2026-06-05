@@ -9,3 +9,13 @@ backup/
 open_source.zip
 .reasonix/
 *.db
+logs/
+# Runtime/generated artifacts
+imports/
+_unused_token_check.json
+batch_phase2_status.json
+msoutlook_used.json
+号.json
+号.json.backup
+删除的账号.json
+.playwright-mcp/

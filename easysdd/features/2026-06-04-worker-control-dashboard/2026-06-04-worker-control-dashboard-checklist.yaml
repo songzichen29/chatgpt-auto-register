@@ -1,0 +1,63 @@
+﻿feature: 2026-06-04-worker-control-dashboard
+created: 2026-06-05
+
+steps:
+  - action: "新增后端控制模块：实现 WorkerProcessController、日志缓冲、启动/停止/状态 API"
+    exit_signal: "能用 fake 命令或 --help 命令完成启动/日志/结束状态测试"
+    status: done
+  - action: "新增核心统计与数据聚合 API：实现 dashboard summary、号池列表、账号列表、账号状态/导出状态读写、原始配置读取保存"
+    exit_signal: "单元测试可用临时 号.json、pool_import_history.json、msoutlook_used.json、_all.json、account_state.json 验证统计口径、状态计算和 JSON 校验"
+    status: done
+  - action: "新增批量操作与 SUB2API 导出 API：支持选中项/筛选全选批量状态修改，按账号筛选导出并可标记 exported"
+    exit_signal: "测试验证导出 JSON 结构、筛选数量、状态写入和跳过不可导出账号"
+    status: done
+  - action: "新增阶段重试 API：实现 retryable 判定、Phase 2-only 续跑任务壳、完整重跑入口和导出重试入口"
+    exit_signal: "测试验证不同失败状态给出正确推荐动作和缺失材料说明；fake retry job 可写入 retry 元数据"
+    status: done
+  - action: "接入 web_gui.py：注册 Blueprint 和 /worker-control 页面入口"
+    exit_signal: "python -m py_compile web_gui.py worker_control.py 通过"
+    status: done
+  - action: "实现前端页面：顶部统计、配置原文编辑、运行、号池、账号条件查询/全选/批量状态、阶段重试、导出、日志联调 API"
+    exit_signal: "浏览器能打开 /worker-control，顶部统计和按钮/表格能完成基本交互"
+    status: done
+  - action: "验证与收尾：运行单元测试、py_compile；不跑真实注册，除非用户明确要求"
+    exit_signal: "列出已验证项和未覆盖风险"
+    status: done
+
+checks:
+  - item: "不重写 worker_pool.py 内部 Phase 1 / Phase 2 / 邮箱租约逻辑"
+    source: 范围守护
+    status: pending
+  - item: "普通账号列表不展示 SUB2API access_token / refresh_token"
+    source: 范围守护
+    status: pending
+  - item: "不做多用户权限系统；多用户版仍归 server.py / runner.py"
+    source: 范围守护
+    status: pending
+  - item: "账号状态由用户人工标记，不自动推断成功试用"
+    source: 范围守护
+    status: pending
+  - item: "导入统计记录 pool_import_history.json，summary 能展示邮箱池导入数量"
+    source: 接口契约
+    status: pending
+  - item: "summary 能统计注册成功、注册失败、Phase 1/2 失败、成功试用账号"
+    source: 接口契约
+    status: pending
+  - item: "账号列表支持注册状态、账号状态、导出状态、关键词、日期范围、分页筛选"
+    source: 接口契约
+    status: pending
+  - item: "批量操作支持 selected 与 filtered 两种范围"
+    source: 接口契约
+    status: pending
+  - item: "SUB2API 导出只导出 imports 中能匹配到 payload 的账号，可选择导出后标记 exported"
+    source: 接口契约
+    status: pending
+  - item: "config.json 原文保存前必须 JSON 校验，失败不覆盖原文件"
+    source: 接口契约
+    status: pending
+  - item: "阶段重试能识别 fail_phase1/full、fail_phase2/phase2、导出缺失/export，并说明缺失材料"
+    source: 接口契约
+    status: pending
+  - item: "单元测试覆盖核心统计、号池状态、账号状态、条件查询、SUB 导出、原始配置编辑、阶段重试判定"
+    source: 测试约束
+    status: pending

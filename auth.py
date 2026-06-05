@@ -34,10 +34,16 @@ def decode_token(token: str) -> dict:
 def login_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
+        # 优先从 Header 取，EventSource 不支持自定义 Header，回退到 URL 参数 ?token=xxx
         auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
+        token = ""
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+        elif request.args.get("token"):
+            token = request.args["token"]
+        if not token:
             return jsonify({"ok": False, "error": "Missing token"}), 401
-        payload = decode_token(auth[7:])
+        payload = decode_token(token)
         if not payload:
             return jsonify({"ok": False, "error": "Invalid or expired token"}), 401
         g.user_id = payload["user_id"]

@@ -1,26 +1,46 @@
 {
-    "smsbower": {
-        "api_key": "YOUR_API_KEY"
-    },
-    "register": {
-        "password": "",
-        "name": "A",
-        "birthdate": "2000-01-01"
-    },
-    "proxy": "",
-    "country": "151",
-    "service": "dr",
-    "code_timeout": 30,
-    "max_price": "",
-
-    "phase2": {
-        "icloud_cookies": "cookies.json",
-        "imap_user": "",
-        "imap_pass": "",
-        "sub2api_url": "",
-        "sub2api_email": "",
-        "sub2api_password": "",
-        "sub2api_group": "CHATGPT",
-        "bind_email": ""
-    }
+  "sms_provider": "smsbower",
+  "smsbower": {
+    "api_key": "YOUR_API_KEY"
+  },
+  "hero_sms": {
+    "api_key": "YOUR_API_KEY",
+    "base_url": ""
+  },
+  "fivesim": {
+    "api_key": "YOUR_API_KEY"
+  },
+  "register": {
+    "password": "",
+    "name": "A",
+    "birthdate": "2000-01-01"
+  },
+  "proxy": "",
+  "country": "151",
+  "service": "dr",
+  "code_timeout": 30,
+  "max_price": "",
+  "logging": {
+    "enabled": true,
+    "dir": "logs",
+    "retention_days": 30,
+    "sanitize": true
+  },
+  "phase2": {
+    "icloud_cookies": "cookies.json",
+    "imap_user": "",
+    "imap_pass": "",
+    "sub2api_url": "",
+    "sub2api_email": "",
+    "sub2api_password": "",
+    "sub2api_group": "CHATGPT",
+    "bind_email": "",
+    "msoutlook_helper_url": "http://127.0.0.1:17373",
+    "msoutlook_email": ""
+  },
+  "msoutlook": {
+    "helper_url": "http://127.0.0.1:17373",
+    "email": "",
+    "helper_bat": ""
+  }
 }

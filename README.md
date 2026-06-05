@@ -91,15 +91,20 @@ python auto_register.py --country 33   # 指定国家
 - Phase 1 注册 + Phase 2 OAuth 绑邮箱上传全自动
 - 结果下载
 
-### iCloud 邮箱（可选）
+### iCloud / 微软邮箱（可选）
 
 如果配置了 SUB2API，注册完成后会自动：
 
-1. 从 iCloud 创建/复用 Hide My Email 别名
+1. 优先使用 MsOutlook 号池（Outlook/Hotmail），或从 iCloud 创建/复用 Hide My Email 别名
 2. OAuth 登录 → 绑定邮箱 → 验证码 → 同意授权
 3. 上传 session_token 到 SUB2API
 
-导入 iCloud Cookies：在 Web GUI 的 "iCloud Cookies 导入" 区域粘贴 JSON，或先运行：
+**MsOutlook 号池**：需要：
+- 将 `号.json` 放在项目根目录（GuJumpgate 导出的微软号池）
+- 启动 Hotmail Helper：`E:\song\下载\GooGle Downloads\GuJumpgate-v0.1.3\GuJumpgate-v0.1.3\start-hotmail-helper.bat`
+- 在 Web GUI 或 config.json 配置 `msoutlook.helper_url`
+
+**iCloud 邮箱**：导入 Cookies：在 Web GUI 的 "iCloud Cookies 导入" 区域粘贴 JSON，或先运行：
 
 ```bash
 python icloud_hme.py export-cookies
@@ -111,15 +116,27 @@ python icloud_hme.py export-cookies
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
+| `sms_provider` | `smsbower` | 接码平台：`smsbower` / `hero-sms` / `5sim` |
 | `smsbower.api_key` | (必填) | SMSBower API Key |
+| `hero_sms.api_key` | (可选) | Hero-SMS API Key |
+| `fivesim.api_key` | (可选) | 5Sim API Key |
 | `register.password` | 随机 | 账号密码 |
 | `register.name` | 随机 | 昵称 |
 | `register.birthdate` | 随机 | 生日 |
 | `proxy` | 直连 | 代理，如 `socks5h://127.0.0.1:10808` |
-| `country` | `151` | SMSBower 国家 ID |
+| `country` | `151` | 国家 ID |
 | `service` | `dr` | 服务代码（`dr`=OpenAI） |
 | `max_price` | 不限 | 号码最高单价 |
 | `code_timeout` | `30` | 验证码等待秒数 |
+| `msoutlook.helper_url` | `http://127.0.0.1:17373` | Hotmail Helper 地址 |
+| `msoutlook.email` | 自动选 | 指定微软邮箱（留空自动选择） |
+
+CLI 用法：
+```bash
+python auto_register.py --sms-provider hero-sms -n 3   # 使用 Hero-SMS
+python auto_register.py --sms-provider 5sim -n 1        # 使用 5Sim
+python auto_register.py                                  # 使用默认的 smsbower
+```
 
 ---
 

@@ -24,7 +24,10 @@ from datetime import datetime
 from pathlib import Path
 
 from chatgpt_register import ChatGPTRegister
-from smsbower import SmsBower
+from phone_sms import PhoneSMS
+
+import file_logger
+file_logger.init()
 
 # ============================================================
 # 随机资料
@@ -68,13 +71,30 @@ def _retry_call(fn, max_retries=2, delay=2, label=""):
                 print(f"  [{label}] 失败 ({e})，{delay}s 后重试 ({attempt+1}/{max_retries})...")
             _time.sleep(delay)
 
+def _cancel_with_eta(sms, phone: str, reason: str, verbose: bool = True):
+    """触发延迟取消并打印资金安全提示。
+
+    hero-sms / SmsBower 协议要求拿号后 ≥150s 才能 setStatus=8，
+    PhoneSMS.cancel 内部会把请求放入延迟队列，到点后由后台线程退款。
+    这里把"预计还需多少秒退款"打出来，让资金去向可见。
+    """
+    try:
+        wait_sec = float(sms.cancel())
+    except Exception:
+        return
+    if verbose:
+        print(f"  [sms] {phone} 已加入取消队列，约 {wait_sec:.0f}s 后退款（{reason}）")
+
 # ============================================================
 # 配置
 # ============================================================
 
 def load_config(path: str = None) -> dict:
     config = {
+        "sms_provider": "smsbower",
         "smsbower": {"api_key": ""},
+        "hero_sms": {"api_key": "", "base_url": ""},
+        "fivesim": {"api_key": ""},
         "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
         "proxy": "",
         "country": "151",
@@ -87,15 +107,20 @@ def load_config(path: str = None) -> dict:
         if p and Path(p).exists():
             with open(p, "r", encoding="utf-8") as f:
                 found = json.load(f)
-            for k in ["smsbower", "register"]:
-                if k in found:
+            if "sms_provider" in found:
+                config["sms_provider"] = found["sms_provider"]
+            for k in ["smsbower", "hero_sms", "fivesim"]:
+                if k in found and isinstance(found[k], dict):
                     config[k].update(found[k])
+            if "register" in found and isinstance(found["register"], dict):
+                config["register"].update(found["register"])
             for k in ["proxy", "country", "service", "code_timeout"]:
                 if k in found:
                     config[k] = found[k]
-            # Passthrough extra keys (e.g. "gui")
+            # Passthrough extra keys (e.g. "gui", "phase2")
             for k, v in found.items():
-                if k not in {"smsbower", "register", "proxy", "country", "service", "code_timeout"}:
+                if k not in {"sms_provider", "smsbower", "hero_sms", "fivesim",
+                             "register", "proxy", "country", "service", "code_timeout"}:
                     config[k] = v
             break
     if os.environ.get("SMSBOWER_KEY"):
@@ -105,24 +130,50 @@ def load_config(path: str = None) -> dict:
         config["proxy"] = proxy_env
     return config
 
+
+def _get_sms_api_key(config: dict, provider: str) -> str:
+    """根据 provider 名称从 config 中获取对应的 API Key"""
+    provider_map = {
+        "smsbower": "smsbower",
+        "hero-sms": "hero_sms",
+        "5sim": "fivesim",
+    }
+    section = provider_map.get(provider, provider)
+    return config.get(section, {}).get("api_key", "") or config.get("smsbower", {}).get("api_key", "")
+
+
 # ============================================================
 # 注册核心
 # ============================================================
 
 def register_one(
-    sms: SmsBower,
     config: dict,
     provider_ids: str = "",
     max_price: str = "",
     verbose: bool = True,
     step_retries: int = 2,
     create_account_max_retries: int = 20,
+    auto_activate: bool = True,
+    existing_phone: dict = None,
+    otp_max_retries: int = 3,
 ) -> dict:
+    """注册一个账号。使用 PhoneSMS 统一接口，支持 smsbower / hero-sms / 5sim。
+
+    auto_activate=False 时不自动激活，由调用方决定激活或取消（避免 Phase 2 失败浪费号码）。
+
+    existing_phone: 可选，传入已有手机号信息 {"phone": "+xxx", "activation_id": "xxx", "password": "xxx"}。
+        传入时跳过 get_number 步骤，复用该号码完成注册流程（Phase 2 邮箱碰撞时从 Phase 1 重跑）。
+    """
     service = config["service"]
     country = config["country"]
     reg_cfg = config["register"]
+    sms_provider = config.get("sms_provider", "smsbower")
 
-    password = reg_cfg["password"] or random_password()
+    # 如果传入了 existing_phone，复用密码；否则生成新密码
+    if existing_phone and existing_phone.get("password"):
+        password = existing_phone["password"]
+    else:
+        password = reg_cfg["password"] or random_password()
     name = reg_cfg.get("name") or random_name()
     birthdate = reg_cfg.get("birthdate") or random_birthdate()
     if name == "A" and birthdate == "2000-01-01":
@@ -134,43 +185,83 @@ def register_one(
     reg = None
     sr = step_retries
 
+    # 根据配置的 provider 创建 PhoneSMS
+    sms = PhoneSMS(sms_provider, _get_sms_api_key(config, sms_provider))
+
     try:
-        aid, phone_raw = sms.get_number(service=service, country=country, provider_ids=provider_ids, max_price=max_price)
-        phone = "+" + phone_raw if not phone_raw.startswith("+") else phone_raw
-        if verbose:
-            print(f"  手机号: {phone}  激活ID: {aid}")
-        sms.set_ready()
+        if existing_phone:
+            # 复用已有手机号（Phase 2 邮箱碰撞重跑 Phase 1）
+            aid = existing_phone["activation_id"]
+            phone = existing_phone["phone"]
+            if verbose:
+                print(f"  复用手机号: {phone}  激活ID: {aid}  [平台:{sms_provider}]")
+        else:
+            aid, phone_raw = sms.get_number(service=service, country=country)
+            phone = "+" + phone_raw if not phone_raw.startswith("+") else phone_raw
+            if verbose:
+                print(f"  手机号: {phone}  激活ID: {aid}  [平台:{sms_provider}]")
 
         reg = ChatGPTRegister(proxy=config["proxy"])
 
         _retry_call(lambda: reg.visit(), sr, label="访问首页")
         csrf = _retry_call(lambda: reg.get_csrf(), sr, label="CSRF")
         redirect = _retry_call(lambda: reg.signin(phone, csrf), sr, label="发起登录")
+        if not redirect:
+            _cancel_with_eta(sms, phone, "signin 无返回", verbose)
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": "signin 无返回(可能被 Cloudflare 拦截)"}
         _retry_call(lambda: reg.jump_to_auth(redirect), sr, label="OAuth跳转")
         result = _retry_call(lambda: reg.register_user(phone, password), sr, label="注册")
 
         continue_url = result.get("continue_url", "")
         if not continue_url:
-            sms.cancel()
-            return {"ok": False, "phone": phone, "error": f"注册被拒(status={result.get('_status')})"}
+            _cancel_with_eta(sms, phone, "注册被拒", verbose)
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"注册被拒(status={result.get('_status')})"}
 
-        _retry_call(lambda: reg.send_otp(continue_url), sr, label="发送验证码")
+        # ---- OTP 验证 ----
+        # 保存注册步骤的 continue_url，校验失败重试时需要重新触发 send_otp
+        send_otp_url = continue_url
+        # 首次发送验证码
+        _retry_call(lambda u=send_otp_url: reg.send_otp(u), sr, label="发送验证码")
         if verbose:
             print(f"  验证码已发送到 {phone}")
 
         code = sms.wait_code(timeout=config["code_timeout"])
         if not code:
-            sms.cancel()
-            return {"ok": False, "phone": phone, "error": "验证码超时"}
+            # 验证码超时：号码收不到验证码，重发也没用，加入延迟取消队列（≥150s 后 setStatus=8 退款）
+            _cancel_with_eta(sms, phone, "验证码超时", verbose)
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": "验证码超时"}
 
         if verbose:
             print(f"  收到验证码: {code}")
 
-        result = _retry_call(lambda: reg.validate_otp(code), sr, label="校验验证码")
-        continue_url = result.get("continue_url", "")
+        # 校验验证码，失败时通过 status=3 重发短信并重试
+        _last_otp_error = ""
+        for otp_attempt in range(otp_max_retries):
+            result = _retry_call(lambda c=code: reg.validate_otp(c), sr, label="校验验证码")
+            continue_url = result.get("continue_url", "")
+            if continue_url:
+                break  # 校验成功，跳出循环
+
+            # 校验失败：请求 SMS 平台重发短信 (status=3)，复用同一号码
+            _last_otp_error = f"验证码校验失败(status={result.get('_status')})"
+            if otp_attempt < otp_max_retries - 1:
+                sms.resend()
+                _retry_call(lambda: reg.send_otp(send_otp_url), sr, label="重新发送验证码")
+                if verbose:
+                    print(f"  {_last_otp_error}，[OTP重试 {otp_attempt + 1}/{otp_max_retries - 1}] 已请求重发验证码到 {phone}")
+                code = sms.wait_code(timeout=config["code_timeout"])
+                if not code:
+                    _last_otp_error = "重发后验证码超时"
+                    break  # 重发后仍收不到，不再继续
+                if verbose:
+                    print(f"  收到验证码: {code}")
+            else:
+                if verbose:
+                    print(f"  {_last_otp_error}，已用完重试次数")
+
         if not continue_url:
-            sms.cancel()
-            return {"ok": False, "phone": phone, "error": f"验证码校验失败(status={result.get('_status')})"}
+            _cancel_with_eta(sms, phone, "OTP 失败", verbose)
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"{_last_otp_error}(已重试{otp_max_retries}次)"}
 
         # ============================================================
         # 先访问 about-you 页面建立会话上下文
@@ -202,12 +293,21 @@ def register_one(
                 _time.sleep(1)
 
         if not callback_url:
-            sms.cancel()
-            return {"ok": False, "phone": phone, "error": f"创建账户失败(已重试{create_account_max_retries}次): {last_create_error[:200]}"}
+            _cancel_with_eta(sms, phone, "创建账户失败", verbose)
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"创建账户失败(已重试{create_account_max_retries}次): {last_create_error[:200]}"}
 
         token = _retry_call(lambda: reg.oauth_callback(callback_url), sr, label="OAuth回调")
         access_token = _retry_call(lambda: reg.get_access_token(), sr, label="获取Token")
-        sms.complete()
+        if auto_activate:
+            try:
+                sms.complete()
+            except Exception as e:
+                if verbose:
+                    print(f"  [WARNING] 激活失败: {e}")
+        else:
+            _log_info = True
+            if verbose:
+                print("  [注册] 跳过激活（由调用方控制）")
 
         return {
             "ok": True, "phone": phone, "password": password,
@@ -218,7 +318,7 @@ def register_one(
     except Exception as e:
         try: sms.cancel()
         except Exception: pass
-        return {"ok": False, "phone": phone, "error": str(e)}
+        return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": str(e)}
 
 # ============================================================
 # CLI
@@ -228,6 +328,9 @@ def main():
     parser = argparse.ArgumentParser(description="ChatGPT 自动注册")
     parser.add_argument("--config", "-c", type=str, help="配置文件路径")
     parser.add_argument("--count", "-n", type=int, default=1, help="目标成功数量")
+    parser.add_argument("--sms-provider", type=str, default="",
+                        choices=["smsbower", "hero-sms", "5sim"],
+                        help="接码平台 (默认 smsbower)")
     parser.add_argument("--country", type=str, help="国家 ID (默认 151=智利)")
     parser.add_argument("--service", type=str, help="服务代码 (默认 dr=OpenAI)")
     parser.add_argument("--provider", type=str, default="", help="指定运营商 ID")
@@ -256,22 +359,25 @@ def main():
         return
 
     config = load_config(args.config)
+    if args.sms_provider: config["sms_provider"] = args.sms_provider
     if args.country: config["country"] = args.country
     if args.service: config["service"] = args.service
     if args.proxy: config["proxy"] = args.proxy
     if args.password: config["register"]["password"] = args.password
 
-    if not config["smsbower"]["api_key"]:
-        print("错误: 需要 SMSBower API Key.")
+    provider = config.get("sms_provider", "smsbower")
+    api_key = _get_sms_api_key(config, provider)
+    if not api_key:
+        print(f"错误: 需要 {provider} API Key (请在 config.json 中配置).")
         sys.exit(1)
 
-    sms = SmsBower(config["smsbower"]["api_key"])
-    bal = sms.balance()
+    sms = PhoneSMS(provider, api_key)
+    bal = sms.client.get_balance()
     try:
         pid, price = sms.get_cheapest_provider(config["service"], config["country"])
     except Exception:
         pid, price = "?", 0
-    print(f"余额: {bal}  国家: {config['country']}  运营商: {pid} (${price:.4f})")
+    print(f"余额: {bal}  平台: {provider}  国家: {config['country']}  运营商: {pid} (${price:.4f})")
     print(f"代理: {config['proxy'] or '直连'}  目标: {args.count}个")
     print("-" * 50)
 
@@ -284,7 +390,7 @@ def main():
         attempt += 1
         print(f"\n第 {attempt} 次 [{ok_count}/{args.count}]")
         try:
-            result = register_one(sms, config, provider_ids=args.provider,
+            result = register_one(config, provider_ids=args.provider,
                                   max_price=args.max_price, step_retries=args.retry,
                                   create_account_max_retries=args.create_retry,
                                   verbose=True)

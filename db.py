@@ -52,10 +52,17 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS user_configs (
                     user_id INT PRIMARY KEY REFERENCES users(id),
                     smsbower_key VARCHAR(200) DEFAULT '',
+                    hero_sms_key VARCHAR(200) DEFAULT '',
+                    fivesim_key VARCHAR(200) DEFAULT '',
                     proxy VARCHAR(200) DEFAULT 'socks5h://127.0.0.1:10808',
                     country VARCHAR(10) DEFAULT '151',
                     max_price VARCHAR(10) DEFAULT '',
                     sms_timeout INT DEFAULT 30,
+                    sub2api_url VARCHAR(200) DEFAULT '',
+                    sub2api_email VARCHAR(100) DEFAULT '',
+                    sub2api_password VARCHAR(100) DEFAULT '',
+                    sub2api_proxy_id INT DEFAULT 0,
+                    sub2api_group VARCHAR(50) DEFAULT 'CHATGPT',
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
                 CREATE TABLE IF NOT EXISTS invite_keys (
@@ -101,6 +108,20 @@ def init_db():
                     key VARCHAR(50) PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT REFERENCES users(id),
+                    phone VARCHAR(30) NOT NULL,
+                    password VARCHAR(100) NOT NULL,
+                    email VARCHAR(100) DEFAULT '',
+                    name VARCHAR(50) DEFAULT '',
+                    birthdate VARCHAR(20) DEFAULT '',
+                    session_token TEXT DEFAULT '',
+                    access_token TEXT DEFAULT '',
+                    sub2api_id VARCHAR(20) DEFAULT '',
+                    status VARCHAR(20) DEFAULT 'ok',
+                    created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
             # Create admin if not exists
@@ -225,7 +246,10 @@ def update_user_config(user_id: int, data: dict):
     try:
         fields = []
         values = []
-        for k in ["smsbower_key", "proxy", "country", "max_price", "sms_timeout"]:
+        for k in ["smsbower_key", "hero_sms_key", "fivesim_key",
+                   "proxy", "country", "max_price", "sms_timeout",
+                   "sub2api_url", "sub2api_email", "sub2api_password",
+                   "sub2api_proxy_id", "sub2api_group"]:
             if k in data:
                 fields.append(f"{k} = %s")
                 values.append(data[k])
@@ -409,7 +433,43 @@ def set_admin_asset(key: str, value: str):
         pool.putconn(conn)
 
 
-# ── REG LOGS ──
+# ── ACCOUNTS (Phase 1/2 results) ──
+def save_account(user_id: int, phone: str, password: str, email: str = "",
+                 name: str = "", birthdate: str = "",
+                 session_token: str = "", access_token: str = "",
+                 sub2api_id: str = "", status: str = "ok"):
+    """Save a registered account (success or failure)."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO accounts (user_id, phone, password, email, name, birthdate, "
+                "session_token, access_token, sub2api_id, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (user_id, phone, password, email, name, birthdate,
+                 session_token, access_token, sub2api_id, status),
+            )
+            conn.commit()
+    finally:
+        pool.putconn(conn)
+
+
+def get_user_accounts(user_id: int, limit: int = 50) -> list:
+    """Get user's registered accounts (newest first)."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM accounts WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+                (user_id, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        pool.putconn(conn)
+
+
+# ─ REG LOGS ──
 def log_reg(user_id: int, phone: str, status: str, email: str = "", error: str = ""):
     pool = get_pool()
     conn = pool.getconn()

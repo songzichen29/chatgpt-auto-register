@@ -8,7 +8,7 @@ OpenAI 后半段 — 纯协议版（基于真实抓包端点）
   [3] POST /api/accounts/authorize/continue  {"username":{"kind":"phone_number","value":"+56..."}}
   [4] POST sentinel/req              flow=password_verify
   [5] POST /api/accounts/password/verify     {"password":"xxx"}
-  [6] POST /api/accounts/add-email/send      {"email":"...@icloud.com"}
+  [6] POST /api/accounts/add-email/send      {"email":"alias@example.test"}
   [7] iCloud 收绑定验证码
   [8] POST /api/accounts/email-otp/validate  {"code":"796880"}
   [9] POST /api/accounts/workspace/select    {"workspace_id":"xxx"}
@@ -17,9 +17,11 @@ OpenAI 后半段 — 纯协议版（基于真实抓包端点）
 """
 
 import re
+import os
 import json
 import time
 import uuid
+import datetime
 import urllib3
 from typing import Optional, Dict, Any, Tuple, Callable
 from urllib.parse import urlparse, parse_qs, urljoin
@@ -282,6 +284,47 @@ class OAuthSecondHalf:
         self._l(f"[5] 响应: page={pt}")
         return data
 
+    # ---------- [5.5] 联系方式验证 (contact_verification) ----------
+
+    def resend_contact_otp(self) -> Dict:
+        """
+        在 contact_verification 页面，重新发送手机 OTP。
+        POST /api/accounts/phone-otp/resend
+        返回: {page:{type:"contact_verification"}} 或 error
+        """
+        self._l("[5.5] 重新发送手机 OTP ...")
+        r = self.session.post(
+            f"{AUTH}/api/accounts/phone-otp/resend",
+            json={},
+            headers=JSON_HEADERS,
+            timeout=30,
+        )
+        if r.ok:
+            self._l("[5.5] 重发成功 (200, 无body)")
+            return {"ok": True}
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": r.text}
+        self._l(f"[5.5] 响应: {data}")
+        return data
+
+    def validate_contact_otp(self, code: str) -> Dict:
+        """
+        在 contact_verification 页面，验证手机 OTP。
+        POST /api/accounts/phone-otp/validate
+           {"code":"123456"}
+        返回: {continue_url:"/add-email", page:{type:"add_email"}} 或 error
+        """
+        self._l(f"[5.5] 验证手机 OTP: {code}")
+        r = self.session.post(
+            f"{AUTH}/api/accounts/phone-otp/validate",
+            json={"code": code},
+            headers=JSON_HEADERS,
+            timeout=30,
+        )
+        data = r.json() if r.ok else {"error": r.text}
+        pt = (data.get("page") or {}).get("type", "")
+        self._l(f"[5.5] 响应: page={pt}")
+        return data
+
     # ---------- [6] 发送绑定邮箱 ----------
 
     def send_bind_email(self, email: str) -> Dict:
@@ -479,6 +522,109 @@ class OAuthSecondHalf:
 # 完整后半段入口
 # ============================================================
 
+def _poll_bind_code(icloud_email, icloud_cookies, imap_user, imap_password,
+                    msoutlook_helper_url, msoutlook_email, verbose, timeout=240,
+                    exclude_codes=None, msoutlook_helper_mode="http",
+                    msoutlook_helper_script=""):
+    """轮询获取绑定验证码，优先 msoutlook，回退 iCloud。
+
+    exclude_codes: list[str] — 调用方在 send_bind_email 之前先取一次邮箱最新码
+        作为 baseline，传到这里。MsOutlookPool.wait_for_code 会把这些码传给
+        Hotmail Helper 的 excludeCodes 参数，跳过这些历史码，只返回 OpenAI
+        本次新发的码。
+
+        为什么需要：邮箱里可能残留上一次注册/绑定的 openai 邮件（旧码已失效），
+        如果不过滤，wait_for_code 第一次轮询就会拿到旧码立即返回，
+        verify_email_otp 必然 wrong_email_otp_code。
+    """
+    def _l(msg): _log(msg)
+
+    # 优先尝试 msoutlook
+    if (msoutlook_helper_url or str(msoutlook_helper_mode or "").strip().lower() == "direct") and msoutlook_email:
+        try:
+            from msoutlook_pool import MsOutlookPool
+            _l(f"[7] MsOutlook 收验证码 ({msoutlook_email}) ...")
+            pool = MsOutlookPool(
+                helper_url=msoutlook_helper_url,
+                verbose=verbose,
+                helper_mode=msoutlook_helper_mode,
+                helper_script=msoutlook_helper_script,
+            )
+
+            code = pool.wait_for_code(
+                msoutlook_email, keyword="openai", timeout=timeout,
+                exclude_codes=exclude_codes,
+            )
+            if code:
+                _l(f"[7] 验证码: {code}")
+                return code
+            _l("[7] MsOutlook 超时，尝试回退到 iCloud")
+        except Exception as e:
+            _l(f"[7] MsOutlook 失败: {e}，回退到 iCloud")
+
+    # 回退到 iCloud
+    _l("[7] iCloud 收验证码 ...")
+    from icloud_hme import ICloudHME
+    icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
+    code = icloud.poll_mail_for_code(
+        target_email=icloud_email,
+        sender_filters=["openai", "noreply", "verification", "no-reply"],
+        timeout=timeout,
+        imap_user=imap_user,
+        imap_password=imap_password,
+    )
+    return code
+
+
+def _get_email_history_codes(msoutlook_helper_url: str, msoutlook_email: str,
+                             verbose: bool = False, msoutlook_helper_mode: str = "http",
+                             msoutlook_helper_script: str = "") -> list:
+    """在 send_bind_email 之前获取邮箱里所有历史 OpenAI 验证码列表。
+
+    为什么需要全部历史码（而不只是最新一封）：
+        Hotmail Helper /code 端点的 excludeCodes 只跳过列表里的码，
+        但 /code 返回的不一定是"最新一封"——可能按邮件 ID 或其他顺序返回。
+        所以只 exclude 最新一封，第二次轮询仍可能拿到更早的历史码。
+        把所有历史码都 exclude，才能保证 wait_for_code 拿到的是 OpenAI 本次新发的码。
+
+    为什么必须 send_bind_email 之前取：
+        那时邮箱里只有历史码，列出来的一定全是旧码。
+        send_bind_email 之后 OpenAI 会发新码，那时再取就会把真码也加进 exclude，
+        导致 wait_for_code 永远拿不到新码。
+
+    返回：去重后的历史码列表（字符串）。失败返回空列表。
+    """
+    if (not msoutlook_helper_url and str(msoutlook_helper_mode or "").strip().lower() != "direct") or not msoutlook_email:
+        return []
+    try:
+        from msoutlook_pool import MsOutlookPool
+        import re
+        pool = MsOutlookPool(
+            helper_url=msoutlook_helper_url,
+            verbose=verbose,
+            helper_mode=msoutlook_helper_mode,
+            helper_script=msoutlook_helper_script,
+        )
+        # 拉取最近 30 封邮件，提取所有 OpenAI 验证码
+        result = pool.get_messages(msoutlook_email, top=30)
+        codes = []
+        for msg in (result.get("messages") or []):
+            text = (msg.get("bodyPreview", "") or "") + " " + (msg.get("subject", "") or "")
+            # OpenAI 验证码是 6 位数字
+            for m in re.finditer(r"\b(\d{6})\b", text):
+                codes.append(m.group(1))
+        # 去重保序
+        seen = set()
+        uniq = []
+        for c in codes:
+            if c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        return uniq
+    except Exception:
+        return []
+
+
 def run_second_half(
     oauth_url: str,
     phone: str,
@@ -496,6 +642,14 @@ def run_second_half(
     imap_password: str = "",
     sub2api_session_id: str = "",
     sub2api_state: str = "",
+    msoutlook_helper_url: str = "",
+    msoutlook_email: str = "",
+    msoutlook_helper_mode: str = "http",
+    msoutlook_helper_script: str = "",
+    save_import: bool = True,
+    interactive_input: bool = True,
+    sms_obj=None,
+    phone_aid: str = "",
 ) -> Dict:
     """
     完整后半段 (基于真实端点):
@@ -552,36 +706,68 @@ def run_second_half(
             return {"ok": False, "error": f"verify_password: {r.get('error')}"}
         page_type = (r.get("page") or {}).get("type", "")
         log(f"[5] page: {page_type}")
+        print(f"  [DEBUG] page_type={repr(page_type)}, about_you={'about_you' in page_type}, consent={'consent' in page_type}, contact_verification={'contact_verification' in page_type}")
 
         # 分支判断
         if "about_you" in page_type:
             # 新号没填资料 → 先填资料
             log("[5] about_you 页, 先填资料 ...")
-            h = dict(JSON_HEADERS)
-            h["referer"] = f"{AUTH}/about-you"
+            h = {
+                "accept": "application/json",
+                "accept-language": "en-US,en;q=0.9",
+                "content-type": "application/json",
+                "origin": AUTH,
+                "user-agent": UA,
+                "sec-ch-ua": '"Google Chrome";v="145"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "referer": f"{AUTH}/about-you",
+                "oai-device-id": flow.device_id,
+            }
+            # 添加 Sentinel token（与 chatgpt_register.py 的 create_account 一致）
+            st = flow._sentinel_token("oauth_create_account")
+            if st:
+                h["OpenAI-Sentinel-Token"] = st
+            log(f"[5] create_account headers: oai-device-id={flow.device_id[:20]}..., sentinel={'yes' if st else 'no'}")
             r = flow.session.post(
                 f"{AUTH}/api/accounts/create_account",
                 json={"name": "A", "birthdate": "2000-01-01"},
                 headers=h,
                 allow_redirects=False,
             )
-            data = r.json() if r.ok else {"error": r.text}
+            log(f"[5] create_account status: {r.status_code}")
+            log(f"[5] create_account body: {r.text[:500] if r.text else 'empty'}")
+            # 健壮解析：按 content-type 判断，避免 302 等非 200 响应解析失败
+            ct = r.headers.get("content-type", "")
+            if ct.startswith("application/json"):
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+            data.setdefault("_status", r.status_code)
+            data.setdefault("_body", r.text[:500] if r.text else "")
             continue_url = data.get("continue_url", "")
             # 检查重定向
             location = r.headers.get("Location", "")
             if location:
-                continue_url = location
+                continue_url = location if location.startswith("http") else f"{AUTH}{location}"
             page_type = (data.get("page") or {}).get("type", "")
             log(f"[5] create_account page: {page_type}")
+            log(f"[5] continue_url: {continue_url[:100] if continue_url else 'empty'}")
             # 资料填完后可能到 add_email
             if "consent" in page_type or "add_email" in page_type or "email_otp" in page_type:
                 pass  # 继续走下面的分支
             else:
-                code = flow.follow_continue_until_code(data.get("continue_url", "")) if data.get("continue_url") else None
+                code = flow.follow_continue_until_code(continue_url) if continue_url else None
                 if not code:
                     code = flow.final_oauth(oauth_params)
                 if not code:
-                    return {"ok": False, "error": "no authorization code after about_you"}
+                    return {"ok": False, "error": f"no authorization code after about_you (status={r.status_code}, page={page_type}, url={continue_url[:80] if continue_url else 'empty'})"}
 
         if "consent" in page_type:
             # 已到同意页 → 选工作区 → 拿 code
@@ -602,32 +788,131 @@ def run_second_half(
             if not code:
                 return {"ok": False, "error": "no authorization code"}
 
+        elif "contact_verification" in page_type:
+            # 已有账号，密码验证后需要验证手机号 OTP
+            log("[5] contact_verification，需要验证手机 OTP ...")
+            # 请求重发短信 OTP
+            r_send = flow.resend_contact_otp()
+            if r_send.get("error"):
+                log(f"[5.5] 重发失败: {r_send.get('error')}")
+                return {"ok": False, "error": f"resend_contact_otp: {r_send.get('error')}"}
+            log("[5.5] 已请求重发短信，等待验证码 ...")
+            # 从 SMS 平台收码
+            code_contact = ""
+            if sms_obj and phone_aid:
+                try:
+                    log("[5.5] 从 SMS 平台等待验证码 ...")
+                    code_contact = sms_obj.wait_for_code(phone_aid, timeout=120)
+                except Exception as e:
+                    log(f"[5.5] SMS 平台收码失败: {e}")
+            if not code_contact and interactive_input:
+                code_contact = input("  [?] 输入手机验证码 (6位): ").strip()
+            if not code_contact:
+                return {"ok": False, "error": "contact_verification code timeout"}
+            log(f"[5.5] 收到验证码: {code_contact}")
+            # 验证手机 OTP
+            r = flow.validate_contact_otp(code_contact)
+            if r.get("error"):
+                log(f"[5.5] 验证失败: {r.get('error')}")
+                return {"ok": False, "error": f"validate_contact_otp: {r.get('error')}"}
+            page_type = (r.get("page") or {}).get("type", "")
+            log(f"[5.5] 验证后 page: {page_type}")
+            # 继续后面的流程
+            if "consent" in page_type:
+                log("[5.5] 已到 consent 页，跳过绑邮箱")
+                dump = flow.get_session_dump()
+                workspaces = ((dump.get("client_auth_session") or {}).get("workspaces") or [])
+                if workspaces:
+                    ws_id = workspaces[0].get("id", "")
+                    log(f"[9] 工作区: {ws_id}")
+                    ws_r = flow.select_workspace(ws_id)
+                    continue_url = ws_r.get("continue_url", "")
+                else:
+                    continue_url = ""
+                code = flow.follow_continue_until_code(continue_url) if continue_url else None
+                if not code:
+                    code = flow.final_oauth(oauth_params)
+                if not code:
+                    return {"ok": False, "error": "no authorization code after contact_verification"}
+
+        elif "contact_verification" in page_type:
+            # 已有账号，密码验证后需要验证手机 OTP
+            log("[5] contact_verification，需要验证手机 OTP ...")
+            # 从 SMS 平台收码
+            code_contact = bind_code
+            if not code_contact:
+                log("[5.5] 从 SMS 平台等待验证码 ...")
+                try:
+                    code_contact = sms_obj.wait_for_code(phone_aid, timeout=180)
+                except Exception as e:
+                    log(f"[5.5] SMS 平台收码失败: {e}")
+            if not code_contact and interactive_input:
+                code_contact = input("  [?] 输入手机验证码 (6位): ").strip()
+            if not code_contact:
+                return {"ok": False, "error": "contact_verification code timeout"}
+            log(f"[5.5] 收到验证码: {code_contact}")
+            # 验证手机 OTP
+            r = flow.validate_contact_otp(code_contact)
+            if r.get("error"):
+                log(f"[5.5] 验证失败: {r.get('error')}")
+                return {"ok": False, "error": f"validate_contact_otp: {r.get('error')}"}
+            page_type = (r.get("page") or {}).get("type", "")
+            log(f"[5.5] 验证后 page: {page_type}")
+            # 继续后面的流程
+            if "consent" in page_type:
+                log("[5.5] 已到 consent 页，跳过绑邮箱")
+                dump = flow.get_session_dump()
+                workspaces = ((dump.get("client_auth_session") or {}).get("workspaces") or [])
+                if workspaces:
+                    ws_id = workspaces[0].get("id", "")
+                    log(f"[9] 工作区: {ws_id}")
+                    ws_r = flow.select_workspace(ws_id)
+                    continue_url = ws_r.get("continue_url", "")
+                else:
+                    continue_url = ""
+                code = flow.follow_continue_until_code(continue_url) if continue_url else None
+                if not code:
+                    code = flow.final_oauth(oauth_params)
+                if not code:
+                    return {"ok": False, "error": "no authorization code after contact_verification"}
+
         elif "email_otp_verification" in page_type:
-            # 先尝试发新的绑定邮件
-            log("[5] email_otp_verification, 先发新邮箱 ...")
+            # email_otp_verification 说明上次 Phase 2 部分完成，
+            # OpenAI 已发验证码到旧绑定邮箱，账号停留在待验证状态。
+            # 尝试重新发码到新邮箱，如果失败说明账号卡住了。
+            log("[5] email_otp_verification，尝试重新发码到新邮箱 ...")
+            history_codes = _get_email_history_codes(
+                msoutlook_helper_url, msoutlook_email, verbose,
+                msoutlook_helper_mode=msoutlook_helper_mode,
+                msoutlook_helper_script=msoutlook_helper_script,
+            )
+            if history_codes:
+                log(f"[7] 邮箱历史码 (将排除): {history_codes}")
+
             if icloud_email:
                 r_send = flow.send_bind_email(icloud_email)
                 send_err = r_send.get("error", "")
                 send_page = (r_send.get("page") or {}).get("type", "")
-                log(f"[6] send result: error={send_err} page={send_page}")
-                if not send_err and "otp_verification" in send_page:
-                    log("[6] 新验证码已发送,等待IMAP...")
+                log(f"[6] 重新发码: error={send_err} page={send_page}")
+                if send_err:
+                    # 发码失败，说明账号卡在旧邮箱验证状态，无法重新发码
+                    return {"ok": False, "error": f"account_stuck_email_otp: {send_err}"}
+                if "otp_verification" in send_page:
+                    log("[6] 新验证码已重新发送,等待收码...")
 
             code_bind = bind_code
             if not code_bind:
-                log("[7] iCloud 收验证码 ...")
-                from icloud_hme import ICloudHME
-                icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
-                code_bind = icloud.poll_mail_for_code(
-                    target_email=icloud_email,
-                    sender_filters=["openai", "noreply", "verification", "no-reply"],
-                    timeout=60,
-                    imap_user=imap_user,
-                    imap_password=imap_password,
+                code_bind = _poll_bind_code(
+                    icloud_email, icloud_cookies, imap_user, imap_password,
+                    msoutlook_helper_url, msoutlook_email, verbose, timeout=240,
+                    exclude_codes=history_codes or None,
+                    msoutlook_helper_mode=msoutlook_helper_mode,
+                    msoutlook_helper_script=msoutlook_helper_script,
                 )
                 if not code_bind:
-                    print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email}")
-                    code_bind = input("  [?] 输入6位验证码: ").strip()
+                    print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email or msoutlook_email}")
+                    if interactive_input:
+                        code_bind = input("  [?] 输入6位验证码: ").strip()
             if not code_bind:
                 return {"ok": False, "error": "binding code timeout"}
             log(f"[7] 验证码: {code_bind}")
@@ -657,30 +942,36 @@ def run_second_half(
         else:
             # 需要绑定新邮箱 (add_email)
             log(f"[6] 绑定邮箱: {icloud_email} ...")
+            # 在 send_bind_email 之前取邮箱所有历史码，作为 exclude 列表
+            history_codes = _get_email_history_codes(
+                msoutlook_helper_url, msoutlook_email, verbose,
+                msoutlook_helper_mode=msoutlook_helper_mode,
+                msoutlook_helper_script=msoutlook_helper_script,
+            )
+            if history_codes:
+                log(f"[7] 邮箱历史码 (将排除): {history_codes}")
             r = flow.send_bind_email(icloud_email)
             if r.get("error"):
                 log(f"[6] 失败: {r.get('error')}")
                 return {"ok": False, "error": f"send_bind_email: {r.get('error')}"}
             log(f"[6] page: {(r.get('page') or {}).get('type', '?')}")
 
-            # ---- [7] iCloud 收码 ----
-            log("[7] iCloud 收验证码 ...")
+            # ---- [7] 收验证码 (优先 msoutlook, 回退 iCloud) ----
             if bind_code:
                 code_bind = bind_code
                 log(f"[7] 使用手动验证码: {code_bind}")
             else:
-                from icloud_hme import ICloudHME
-                icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
-                code_bind = icloud.poll_mail_for_code(
-                    target_email=icloud_email,
-                    sender_filters=["openai", "noreply", "verification", "no-reply"],
-                    timeout=60,
-                    imap_user=imap_user,
-                    imap_password=imap_password,
+                code_bind = _poll_bind_code(
+                    icloud_email, icloud_cookies, imap_user, imap_password,
+                    msoutlook_helper_url, msoutlook_email, verbose, timeout=240,
+                    exclude_codes=history_codes or None,
+                    msoutlook_helper_mode=msoutlook_helper_mode,
+                    msoutlook_helper_script=msoutlook_helper_script,
                 )
                 if not code_bind:
-                    print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email}")
-                    code_bind = input("  [?] 输入6位验证码: ").strip()
+                    print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email or msoutlook_email}")
+                    if interactive_input:
+                        code_bind = input("  [?] 输入6位验证码: ").strip()
                 if not code_bind:
                     return {"ok": False, "error": "binding code timeout"}
             log(f"[7] 绑定验证码: {code_bind}")
@@ -714,10 +1005,17 @@ def run_second_half(
             log("[11] SUB2API exchange-code ...")
             import requests as req_lib, time as _time
 
+            # SUB2API 请求走代理（如果配置了 proxy）
+            _sub_kwargs = {}
+            if proxy:
+                _sub_kwargs["proxies"] = {"http": proxy, "https": proxy}
+                _sub_kwargs["verify"] = False
+
             resp = req_lib.post(
                 f"{sub2api_url}/api/v1/auth/login",
                 json={"email": sub2api_email, "password": sub2api_password},
                 timeout=30,
+                **_sub_kwargs,
             )
             d = resp.json()
             if d.get("code") != 0:
@@ -727,18 +1025,29 @@ def run_second_half(
 
             # 用 exchange-code 换 token (带重试)
             exchange_data = None
+            retryable_status = {429, 500, 502, 503, 504}
             for attempt in range(3):
                 log(f"[11] exchange-code 尝试 {attempt+1}/3 ...")
-                r = req_lib.post(
-                    f"{sub2api_url}/api/v1/admin/openai/exchange-code",
-                    json={
-                        "session_id": sub2api_session_id,
-                        "code": code,
-                        "state": sub2api_state,
-                    },
-                    headers={"Authorization": f"Bearer {admin_token}"},
-                    timeout=300,
-                )
+                try:
+                    r = req_lib.post(
+                        f"{sub2api_url}/api/v1/admin/openai/exchange-code",
+                        json={
+                            "session_id": sub2api_session_id,
+                            "code": code,
+                            "state": sub2api_state,
+                        },
+                        headers={"Authorization": f"Bearer {admin_token}"},
+                        timeout=300,
+                        **_sub_kwargs,
+                    )
+                except req_lib.exceptions.RequestException as e:
+                    log(f"[11] 请求异常: {e}")
+                    if attempt < 2:
+                        log(f"[11] {attempt+1}s 后重试...")
+                        _time.sleep(attempt + 1)
+                        continue
+                    return {"ok": False, "error": f"exchange-code request failed: {e}"}
+
                 log(f"[11] response: {r.status_code}")
                 if r.status_code == 200:
                     try:
@@ -746,45 +1055,78 @@ def run_second_half(
                     except Exception:
                         exchange_data = r.json()
                     break
-                elif r.status_code == 502:
-                    log(f"[11] 502, retrying in {attempt+1}s...")
-                    _time.sleep(attempt + 1)
-                    continue
+                elif r.status_code in retryable_status:
+                    log(f"[11] exchange-code 可重试失败: {r.status_code} {r.text[:200]}")
+                    if attempt < 2:
+                        log(f"[11] {attempt+1}s 后重试...")
+                        _time.sleep(attempt + 1)
+                        continue
+                    return {"ok": False, "error": f"exchange-code retryable status after 3 retries: {r.status_code}"}
                 else:
                     log(f"[11] exchange-code 失败: {r.status_code} {r.text[:200]}")
                     return {"ok": False, "error": f"exchange-code: {r.status_code}"}
 
             if not exchange_data:
-                return {"ok": False, "error": "exchange-code 502 after 3 retries"}
+                return {"ok": False, "error": "exchange-code failed after 3 retries"}
 
-            # 用 exchange-code 返回的 credentials 创建账号
+            # 用 exchange-code 返回的 credentials 生成 SUB2API 导入 JSON
             creds = exchange_data.get("data", exchange_data)
             email_from_creds = creds.get("email", "") or icloud_email
 
-            body = {
-                "name": email_from_creds,
-                "platform": "openai",
-                "type": "oauth",
-                "credentials": {
-                    "access_token": creds.get("access_token", ""),
-                    "refresh_token": creds.get("refresh_token", ""),
-                    "expires_at": creds.get("expires_at", 0),
-                    "email": email_from_creds,
-                },
-                "group_ids": [4],
-                "priority": 1,
-                "concurrency": 10,
-                "auto_pause_on_expired": True,
+            # 构建符合 SUB2API 导入文件格式（直接对象，不带 data 包裹）
+            import_payload = {
+                "type": "sub2api-data",
+                "version": 1,
+                "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "proxies": [],
+                "accounts": [
+                    {
+                        "name": email_from_creds,
+                        "platform": "openai",
+                        "type": "oauth",
+                        "credentials": {
+                            "access_token": creds.get("access_token", ""),
+                            "refresh_token": creds.get("refresh_token", ""),
+                            "expires_at": creds.get("expires_at", 0),
+                            "email": email_from_creds,
+                            "play_type": "free",
+                        },
+                        "priority": 1,
+                        "concurrency": 10,
+                        "auto_pause_on_expired": True,
+                    }
+                ],
             }
-            r = req_lib.post(
-                f"{sub2api_url}/api/v1/admin/accounts",
-                json=body,
-                headers={"Authorization": f"Bearer {admin_token}"},
-                timeout=30,
-            )
-            d = r.json()
-            log(f"[11] 账号创建: code={d.get('code')} id={d.get('data',{}).get('id','?')}")
-            return {"ok": True, "code": code, "sub2api_account_id": str(d.get("data", {}).get("id", ""))}
+
+            if save_import:
+                # 保存到统一导入文件（追加模式）
+                import datetime
+                ts = datetime.datetime.now().strftime("%Y%m%d")
+                filename = f"import_{ts}.json"
+                filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imports", filename)
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+                if os.path.exists(filepath):
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                    # 兼容两种格式：带 data 包裹 / 直接对象
+                    if "data" in existing and isinstance(existing["data"], dict):
+                        existing["data"]["accounts"].append(import_payload["accounts"][0])
+                    else:
+                        existing["accounts"].append(import_payload["accounts"][0])
+                    payload_to_save = existing
+                else:
+                    payload_to_save = import_payload
+
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(payload_to_save, f, indent=2, ensure_ascii=False)
+
+                acc_count = len(payload_to_save.get("data", payload_to_save).get("accounts", []))
+                log(f"[11] 已追加到导入文件: {filepath} (当前共 {acc_count} 个账号)")
+                return {"ok": True, "code": code, "sub2api_account_id": "", "import_file": filepath, "import_data": import_payload}
+
+            log("[11] save_import=False，跳过内部导入文件写入")
+            return {"ok": True, "code": code, "sub2api_account_id": "", "import_file": "", "import_data": import_payload}
 
         log("[11] 无 SUB2API 配置, 仅返回 code")
         return {"ok": True, "code": code}

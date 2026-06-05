@@ -14,8 +14,19 @@ SMSBOWER_API = "https://smsbower.page/stubs/handler_api.php"
 
 def _call(api_key: str, params: dict) -> str:
     params["api_key"] = api_key
-    r = requests.get(SMSBOWER_API, params=params, timeout=30)
-    text = r.text.strip()
+    # 网络异常自动重试，避免 SSL/Connection 错误直接抛出
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(SMSBOWER_API, params=params, timeout=30)
+            text = r.text.strip()
+            break
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    else:
+        raise last_err
     # SMSBower sometimes returns JSON errors instead of text
     if text.startswith("{") and "message" in text:
         try:
@@ -107,10 +118,21 @@ class SmsBower:
         if not self.activation_id:
             raise RuntimeError("No active activation")
         started = time.time()
+        _net_errors = 0
         while time.time() - started < timeout:
-            resp = _call(self.api_key, {
-                "action": "getStatus", "id": self.activation_id
-            })
+            try:
+                resp = _call(self.api_key, {
+                    "action": "getStatus", "id": self.activation_id
+                })
+                _net_errors = 0
+            except requests.exceptions.RequestException as e:
+                _net_errors += 1
+                print(f"  [smsbower] 轮询网络异常 ({_net_errors}): {e}")
+                if _net_errors >= 5:
+                    print(f"  [smsbower] 连续 {_net_errors} 次网络异常，放弃轮询")
+                    return None
+                time.sleep(interval)
+                continue
             if resp.startswith("STATUS_OK:"):
                 return resp.split(":", 1)[1].strip()
             elif resp == "STATUS_CANCEL":

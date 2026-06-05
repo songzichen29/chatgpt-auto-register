@@ -11,8 +11,9 @@
 """
 
 import time
+import threading
 import requests
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 
 
@@ -62,8 +63,17 @@ class HeroSMS:
 
     def _call(self, params: Dict[str, str]) -> str:
         params["api_key"] = self.api_key
-        resp = requests.get(self.base_url, params=params, timeout=30)
-        return resp.text.strip()
+        # 网络异常自动重试，避免 SSL/Connection 错误导致整个流程失败
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(self.base_url, params=params, timeout=30)
+                return resp.text.strip()
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        raise last_err
 
     def get_balance(self) -> float:
         params = {"action": "getBalance"}
@@ -71,6 +81,30 @@ class HeroSMS:
         if result.startswith("ACCESS_BALANCE:"):
             return float(result.split(":")[1])
         raise RuntimeError(f"查询余额失败: {result}")
+
+    def get_cheapest_provider(
+        self, service: str = "dr", country: str = "151"
+    ) -> tuple[str, float]:
+        """获取最便宜的运营商 ID 和价格 (SmsBower/hero-sms 兼容)"""
+        r = requests.get(
+            self.base_url,
+            params={
+                "api_key": self.api_key,
+                "action": "getPricesV3",
+                "service": service,
+                "country": country,
+            },
+            timeout=15,
+        )
+        data = r.json()
+        providers = data.get(country, {}).get(service, {})
+        cheapest, cheapest_price = "", 999.0
+        for pid, info in providers.items():
+            price = float(info.get("price", 999))
+            if price < cheapest_price:
+                cheapest_price = price
+                cheapest = pid
+        return cheapest, cheapest_price
 
     def get_number(
         self,
@@ -127,8 +161,23 @@ class HeroSMS:
     ) -> Optional[str]:
         """轮询等待验证码，超时返回 None"""
         start = time.time()
+        _net_errors = 0  # 连续网络错误计数
         while time.time() - start < timeout:
-            status = self.get_status(activation_id)
+            try:
+                status = self.get_status(activation_id)
+                _net_errors = 0  # 成功后重置计数
+            except requests.exceptions.RequestException as e:
+                _net_errors += 1
+                if verbose:
+                    print(f"  [hero-sms] 轮询网络异常 ({_net_errors}): {e}")
+                # 连续 5 次网络错误才放弃，否则继续轮询
+                if _net_errors >= 5:
+                    if verbose:
+                        print(f"  [hero-sms] 连续 {_net_errors} 次网络异常，放弃轮询")
+                    return None
+                time.sleep(interval)
+                continue
+
             if verbose:
                 print(f"  [hero-sms] 轮询 {activation_id}: {status}")
 
@@ -143,11 +192,15 @@ class HeroSMS:
             else:
                 time.sleep(interval)
 
-        self.cancel(activation_id)
+        # 不再主动 cancel。hero-sms / SmsBower 协议要求拿号后 ≥150s 才能
+        # setStatus=8，否则平台拒绝且不退款。由上层 PhoneSMS 统一走延迟队列。
         return None
 
     def cancel(self, activation_id: str) -> bool:
-        """取消激活（释放号码）"""
+        """取消激活（释放号码）。
+
+        注意：调用方需自行保证距 getNumber 已 ≥150s，否则平台会拒绝。
+        """
         result = self._call({
             "action": "setStatus",
             "id": activation_id,
@@ -243,8 +296,22 @@ class FiveSim:
     ) -> Optional[str]:
         """轮询等待验证码"""
         start = time.time()
+        _net_errors = 0
         while time.time() - start < timeout:
-            messages = self.check_sms(activation_id)
+            try:
+                messages = self.check_sms(activation_id)
+                _net_errors = 0
+            except requests.exceptions.RequestException as e:
+                _net_errors += 1
+                if verbose:
+                    print(f"  [5sim] 轮询网络异常 ({_net_errors}): {e}")
+                if _net_errors >= 5:
+                    if verbose:
+                        print(f"  [5sim] 连续 {_net_errors} 次网络异常，放弃轮询")
+                    return None
+                time.sleep(interval)
+                continue
+
             if verbose:
                 print(f"  [5sim] 轮询 {activation_id}: {len(messages)} 条短信")
 
@@ -261,7 +328,7 @@ class FiveSim:
 
             time.sleep(interval)
 
-        self.cancel(activation_id)
+        # 不再主动 cancel，由上层 PhoneSMS 统一走延迟队列处理。
         return None
 
     def cancel(self, activation_id: str) -> bool:
@@ -306,32 +373,167 @@ class PhoneSMS:
         "5sim": FiveSim,
     }
 
+    # hero-sms / SmsBower 协议要求：getNumber 后 ≥150s 才能 setStatus=8
+    # 否则平台直接拒绝，号码无法主动退款（只能等平台自然过期）。
+    CANCEL_MIN_HOLD = 150.0
+
     def __init__(self, provider: str = "hero-sms", api_key: str = ""):
         if provider not in self.PROVIDERS:
             raise ValueError(f"不支持的接码平台: {provider}，可选: {list(self.PROVIDERS)}")
         self.provider = provider
         self.client = self.PROVIDERS[provider](api_key)
+        self._activation_id: Optional[str] = None  # 记录最近一次激活的 ID
+        self._activated_at: Optional[float] = None  # 拿号时间戳，用于冷却期计算
+
+        # 延迟取消队列：[(aid, fire_at, attempts), ...]
+        # 主流程的 cancel() 入队后立即返回，由后台线程到点发送 setStatus=8。
+        # 这样既满足协议 150s 冷却期，又不阻塞主注册循环。
+        self._pending_cancels: List[Tuple[str, float, int]] = []
+        self._pending_lock = threading.Lock()
+        self._cancel_thread = threading.Thread(
+            target=self._cancel_worker, daemon=True, name="phonesms-cancel"
+        )
+        self._cancel_thread.start()
 
     def get_number(
         self,
         service: str = "openai",
         country: str = "thailand",
-    ) -> Activation:
-        return self.client.get_number(service=service, country=country)
+    ) -> tuple:
+        """获取号码，返回 (activation_id, phone) 元组，兼容 SmsBower 接口"""
+        act = self.client.get_number(service=service, country=country)
+        self._activation_id = act.id
+        self._activated_at = time.time()
+        return act.id, act.phone
 
     def wait_for_code(
         self,
-        activation_id: str,
+        activation_id: str = None,
         timeout: int = 180,
         verbose: bool = True,
     ) -> Optional[str]:
-        return self.client.wait_for_code(activation_id, timeout=timeout, verbose=verbose)
+        aid = activation_id or self._activation_id
+        if not aid:
+            raise RuntimeError("No active activation")
+        return self.client.wait_for_code(aid, timeout=timeout, verbose=verbose)
 
-    def cancel(self, activation_id: str):
-        self.client.cancel(activation_id)
+    def wait_code(self, timeout: int = 300, interval: int = 3) -> Optional[str]:
+        """SmsBower 兼容别名：轮询等待验证码"""
+        return self.wait_for_code(timeout=timeout)
 
-    def finish(self, activation_id: str):
-        self.client.finish(activation_id)
+    def cancel(self, activation_id: str = None, min_hold: Optional[float] = None) -> float:
+        """请求取消激活。考虑 hero-sms / SmsBower 协议的 150s 冷却期。
+
+        策略 B+C：
+          - B（延迟取消）：把请求放入延迟队列，主流程立即返回，
+            到点后由后台线程发送 setStatus=8。
+          - C（自然过期兜底）：若平台仍然拒绝（号码已收过短信、已被服务端释放等），
+            重试一次后放弃，依赖平台在保留期结束后自动退款。
+
+        返回值：预计距真正发送 cancel 还需等待的秒数（≥0）。
+                若没记录拿号时间或 aid 缺失，返回 0.0。
+                调用方可忽略返回值；旧调用方保持兼容。
+        """
+        aid = activation_id or self._activation_id
+        if not aid:
+            return 0.0
+        if min_hold is None:
+            min_hold = self.CANCEL_MIN_HOLD
+        now = time.time()
+        if self._activated_at is not None:
+            elapsed = now - self._activated_at
+        else:
+            elapsed = min_hold  # 没记录拿号时间，直接放行
+        wait_sec = max(0.0, min_hold - elapsed)
+        fire_at = now + wait_sec
+        with self._pending_lock:
+            # 避免重复入队
+            if not any(item[0] == aid for item in self._pending_cancels):
+                self._pending_cancels.append((aid, fire_at, 0))
+        return wait_sec
+
+    def _cancel_worker(self):
+        """后台守护线程：扫描延迟队列，到点发送 cancel。
+
+        - 每 2 秒扫描一次。
+        - 到点后调用 self.client.cancel(aid)。
+        - 平台拒绝（hero-sms 在冷却期内会返回非 ACCESS_CANCEL / 5sim 返回非 200）
+          时再重试 1 次，间隔 10 秒；仍失败则放弃（依赖平台自然过期退款）。
+        """
+        while True:
+            time.sleep(2)
+            now = time.time()
+            ready: List[Tuple[str, float, int]] = []
+            with self._pending_lock:
+                remaining: List[Tuple[str, float, int]] = []
+                for item in self._pending_cancels:
+                    aid, fire_at, attempts = item
+                    if fire_at <= now:
+                        ready.append(item)
+                    else:
+                        remaining.append(item)
+                self._pending_cancels = remaining
+
+            for aid, _fire_at, attempts in ready:
+                try:
+                    ok = bool(self.client.cancel(aid))
+                except Exception:
+                    ok = False
+                if ok:
+                    continue
+                # 平台拒绝：重试一次（10s 后），仍失败则放弃
+                if attempts >= 1:
+                    continue
+                with self._pending_lock:
+                    if not any(x[0] == aid for x in self._pending_cancels):
+                        self._pending_cancels.append((aid, now + 10, attempts + 1))
+
+    def finish(self, activation_id: str = None):
+        aid = activation_id or self._activation_id
+        if aid:
+            self.client.finish(aid)
+
+    def resend(self, activation_id: str = None):
+        """请求重新发送短信 (status=3)，复用该号码"""
+        aid = activation_id or self._activation_id
+        if aid and hasattr(self.client, "_call"):
+            self.client._call({"action": "setStatus", "id": aid, "status": "3"})
+
+    # ---- SmsBower 兼容方法（无参，使用最近激活的 ID） ----
+
+    def set_ready(self):
+        """空操作。
+
+        hero-sms / SmsBower 的 setStatus 协议只接受三种状态：
+            3 — 请求重发短信
+            6 — 完成激活（确认付款）
+            8 — 取消激活（退款）
+        不存在"号码就绪"的 setStatus 状态。getNumber 返回后号码已自动进入
+        STATUS_WAIT_CODE，不需要客户端再做任何声明。
+        保留此方法仅为兼容已有调用方（auto_register.py:168）。
+        """
+        return
+
+    def complete(self, activation_id: str = None):
+        """标记激活完成 (status=6)。
+
+        可选传入 activation_id；不传则使用最近一次 get_number 拿到的 ID。
+        兼容 web_gui 等场景：在 worker 注册完成后，用一个新 PhoneSMS 实例
+        激活当时的号码（新实例的 self._activation_id 是空的，必须靠参数）。
+        """
+        aid = activation_id or self._activation_id
+        if not aid:
+            return
+        if hasattr(self.client, "finish"):
+            self.client.finish(aid)
+        elif hasattr(self.client, "_call"):
+            self.client._call({"action": "setStatus", "id": aid, "status": "6"})
+
+    def get_cheapest_provider(self, service: str = "dr", country: str = "151") -> tuple:
+        """获取最便宜的运营商 (仅 smsbower/hero-sms 支持)"""
+        if hasattr(self.client, "get_cheapest_provider"):
+            return self.client.get_cheapest_provider(service, country)
+        return "?", 0
 
 
 # ============================================================

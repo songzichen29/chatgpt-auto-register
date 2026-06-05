@@ -6,7 +6,7 @@
 body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#f5f0e8;color:#4a3728;min-height:100vh}
 .nav{background:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #e0d5c5;position:sticky;top:0;z-index:10}
 .nav h1{font-size:18px;color:#6b4226}.nav .user{font-size:13px;color:#8b6f4e;flex:1}
-.nav button{padding:6px 14px;border:1px solid #c4820e;border-radius:4px;background:#fff;color:#c4820e;cursor:pointer;font-size:12px}
+.nav button{position:relative;z-index:100;padding:6px 14px;border:1px solid #c4820e;border-radius:4px;background:#fff;color:#c4820e;cursor:pointer;font-size:12px;pointer-events:auto}
 .nav button:hover{background:#c4820e;color:#fff}
 .container{max-width:1100px;margin:0 auto;padding:20px}
 .card{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;border:1px solid #e8d5b0}
@@ -96,6 +96,7 @@ th{color:#8b6f4e;font-weight:600}
 
   <div class="card"><h2>管理员资产</h2>
     <label>MailManage API Key</label><input id="asset-mmkey">
+    <label>MsOutlook Helper URL</label><input id="asset-msoutlook-url" value="http://127.0.0.1:17373">
     <label>iCloud Cookies (JSON)</label><textarea id="asset-icloud" rows="3" style="width:100%" placeholder='{"X-APPLE-...": "..."}'></textarea>
     <button class="primary" style="margin-top:8px" onclick="saveAssets()">保存</button>
   </div>
@@ -119,14 +120,33 @@ th{color:#8b6f4e;font-weight:600}
         <button class="primary" style="margin-top:8px;width:100%" onclick="doRedeem()">兑换</button>
       </div>
       <div class="card"><h2>接码配置</h2>
+        <label>接码平台</label>
+        <select id="cfg-provider"><option value="smsbower">SMSBower</option><option value="hero-sms">Hero-SMS</option><option value="5sim">5Sim</option></select>
         <label>SMSBower Key</label><input id="cfg-key">
+        <label>Hero-SMS Key</label><input id="cfg-hero-key">
+        <label>5Sim Key</label><input id="cfg-fivesim-key">
         <label>代理</label><input id="cfg-proxy" value="socks5h://127.0.0.1:10808">
         <label>国家</label><input id="cfg-country" value="151">
         <label>最高价格</label><input id="cfg-price" placeholder="留空=不限">
         <button class="primary" style="margin-top:8px;width:100%" onclick="saveCfg()">保存配置</button>
       </div>
+      <div class="card"><h2>SUB2API 配置</h2>
+        <label>SUB2API 地址</label><input id="cfg-sub-url" placeholder="http://xxx:8003">
+        <label>SUB2API 管理邮箱</label><input id="cfg-sub-email" placeholder="admin@xxx.com">
+        <label>SUB2API 管理密码</label><input id="cfg-sub-pwd" type="password" placeholder="">
+        <label>Proxy ID</label><input id="cfg-sub-proxy" value="0" type="number">
+        <label>分组</label><input id="cfg-sub-group" value="CHATGPT">
+        <button class="primary" style="margin-top:8px;width:100%" onclick="saveCfg()">保存 SUB2API 配置</button>
+      </div>
     </div>
     <div class="col">
+      <div class="card"><h2>Phase 2 Only（已有手机号+密码）</h2>
+        <label>手机号</label><input id="p2-phone" placeholder="+xxx">
+        <label>密码</label><input id="p2-password" type="password" placeholder="">
+        <label>绑定邮箱</label><input id="p2-email" placeholder="alias@example.test">
+        <button class="primary" style="margin-top:8px;width:100%" onclick="startPhase2()">开始 Phase 2</button>
+        <div style="margin-top:8px" class="log" id="p2-log"><span class="info">等待启动...</span></div>
+      </div>
       <div class="card"><h2>注册控制</h2>
         <label>目标数量</label><input id="m-count" value="1" type="number" min="1" max="99">
         <div class="row" style="margin-top:8px">
@@ -137,7 +157,8 @@ th{color:#8b6f4e;font-weight:600}
       </div>
     </div>
   </div>
-  <div class="card"><h2>历史记录</h2><table id="hist-table"><thead><tr><th>时间</th><th>手机号</th><th>邮箱</th><th>状态</th></tr></thead><tbody></tbody></table></div>
+  <div class="card"><h2>成功账号</h2><table id="acc-table"><thead><tr><th>手机号</th><th>密码</th><th>邮箱</th><th>SUB2API</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+  <div class="card"><h2>历史记录</h2><table id="hist-table"><thead><tr><th>时间</th><th>手机号</th><th>邮箱</th><th>状态</th><th>错误</th></tr></thead><tbody></tbody></table></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -213,34 +234,56 @@ function genCards(){
 function revokeInvite(id){if(confirm('吊销该邀请码？'))fetch('/api/admin/invite/'+id,{method:'DELETE',headers:auth()}).then(function(){refreshAdmin();});}
 function revokeCard(id){if(confirm('吊销该卡密？'))fetch('/api/admin/card/'+id,{method:'DELETE',headers:auth()}).then(function(){refreshAdmin();});}
 function saveAssets(){
-  fetch('/api/admin/assets',{method:'PUT',headers:auth(),body:JSON.stringify({mailmanage_key:G('asset-mmkey').value,icloud_cookies:G('asset-icloud').value})})
+  fetch('/api/admin/assets',{method:'PUT',headers:auth(),body:JSON.stringify({mailmanage_key:G('asset-mmkey').value,msoutlook_helper_url:G('asset-msoutlook-url').value,icloud_cookies:G('asset-icloud').value})})
   .then(function(r){return r.json()}).then(function(j){toast(j.ok?'保存成功':'保存失败',j.ok);});
 }
 
-// ── Member ──
+// ── Member ─
 function refreshMember(){
   fetch('/api/member/me',{headers:auth()}).then(function(r){return r.json()}).then(function(j){
     var u=j.user||{},c=j.config||{},ic=j.icloud||{};
     document.getElementById('mem-quota').textContent=u.quota||0;
     document.getElementById('mem-success').textContent=u.total_success||0;
     document.getElementById('mem-icloud').textContent=ic.active?ic.remaining:'无';
-    G('cfg-key').value=c.smsbower_key||'';G('cfg-proxy').value=c.proxy||'socks5h://127.0.0.1:10808';
+    G('cfg-key').value=c.smsbower_key||'';G('cfg-hero-key').value=c.hero_sms_key||'';
+    G('cfg-fivesim-key').value=c.fivesim_key||'';G('cfg-proxy').value=c.proxy||'socks5h://127.0.0.1:10808';
     G('cfg-country').value=c.country||'151';G('cfg-price').value=c.max_price||'';
+    G('cfg-sub-url').value=c.sub2api_url||'';G('cfg-sub-email').value=c.sub2api_email||'';
+    G('cfg-sub-pwd').value=c.sub2api_password||'';G('cfg-sub-proxy').value=c.sub2api_proxy_id||0;
+    G('cfg-sub-group').value=c.sub2api_group||'CHATGPT';
   });
+  refreshAccounts();
   fetch('/api/member/history',{headers:auth()}).then(function(r){return r.json()}).then(function(j){
     var t=document.getElementById('hist-table').querySelector('tbody');t.innerHTML='';
     (j.history||[]).forEach(function(h){
-      t.innerHTML+='<tr><td>'+h.created_at+'</td><td>'+h.phone+'</td><td>'+h.email+'</td><td><span class="tag tag-'+(h.status=='ok'?'ok':'fail')+'">'+h.status+'</span></td></tr>';
+      var tm=h.created_at||'';
+      if(tm.indexOf('T')>0){tm=tm.split('.')[0].replace('T',' ');}
+      else{try{var d=new Date(tm);if(!isNaN(d)){tm=d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate()+' '+('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);}}catch(e){}}
+      var err=h.error||'';
+      t.innerHTML+='<tr><td>'+tm+'</td><td>'+h.phone+'</td><td>'+h.email+'</td><td><span class="tag tag-'+(h.status=='ok'?'ok':'fail')+'">'+h.status+'</span></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+err.replace(/"/g,'&quot;')+'">'+err+'</td></tr>';
     });
   });
 }
+function refreshAccounts(){
+  fetch('/api/member/accounts',{headers:auth()}).then(function(r){return r.json()}).then(function(j){
+    var t=document.getElementById('acc-table').querySelector('tbody');t.innerHTML='';
+    (j.accounts||[]).forEach(function(a){
+      var pwMask='••••••••';
+      t.innerHTML+='<tr><td>'+a.phone+'</td><td style="cursor:pointer" onclick="copyText(\''+a.password.replace(/'/g,"\\'")+'\')" title="点击复制">'+pwMask+'</td><td>'+a.email+'</td><td>'+((a.sub2api_id&&a.sub2api_id!=='')?a.sub2api_id:'—')+'</td><td><button class="neutral" onclick="copyText(\''+a.phone.replace(/'/g,"\\'")+'\\n'+a.password.replace(/'/g,"\\'")+'\')">复制账号</button></td></tr>';
+    });
+  });
+}
+function copyText(t){
+  if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){toast('已复制到剪贴板',true);});}
+  else{var el=document.createElement('textarea');el.value=t;document.body.appendChild(el);el.select();document.execCommand('copy');document.body.removeChild(el);toast('已复制到剪贴板',true);}
+}
 function saveCfg(){
-  fetch('/api/member/config',{method:'PUT',headers:auth(),body:JSON.stringify({smsbower_key:G('cfg-key').value,proxy:G('cfg-proxy').value,country:G('cfg-country').value,max_price:G('cfg-price').value})})
+  fetch('/api/member/config',{method:'PUT',headers:auth(),body:JSON.stringify({smsbower_key:G('cfg-key').value,hero_sms_key:G('cfg-hero-key').value,fivesim_key:G('cfg-fivesim-key').value,proxy:G('cfg-proxy').value,country:G('cfg-country').value,max_price:G('cfg-price').value,sub2api_url:G('cfg-sub-url').value,sub2api_email:G('cfg-sub-email').value,sub2api_password:G('cfg-sub-pwd').value,sub2api_proxy_id:parseInt(G('cfg-sub-proxy').value)||0,sub2api_group:G('cfg-sub-group').value})})
   .then(function(r){return r.json()}).then(function(j){toast(j.ok?'保存成功':'保存失败',j.ok);});
 }
 
 // ── Registration ──
-var evtSource=null;
+var evtSource=null,p2EvtSource=null;
 function startReg(){
   saveCfg();
   var c=parseInt(G('m-count').value)||1;
@@ -250,6 +293,23 @@ function startReg(){
     else toast(j.error,false);
   });
 }
+function startPhase2(){
+  saveCfg();
+  fetch('/api/member/phase2/start',{method:'POST',headers:auth(),body:JSON.stringify({phone:G('p2-phone').value,password:G('p2-password').value,bind_email:G('p2-email').value})})
+  .then(function(r){return r.json()}).then(function(j){
+    if(j.ok){connectP2Log();toast('Phase 2 已启动',true);}
+    else toast(j.error,false);
+  });
+}
+function connectP2Log(){
+  if(p2EvtSource){p2EvtSource.close();p2EvtSource=null;}
+  var log=document.getElementById('p2-log');log.innerHTML='';
+  p2EvtSource=new EventSource('/api/member/register/log?token='+TOKEN);
+  p2EvtSource.onmessage=function(e){
+    if(!e.data)return;
+    try{var item=JSON.parse(e.data);if(item.msg){var div=document.createElement('div');div.innerHTML='<span class="time">'+item.time+'</span>'+item.msg;div.className=item.tag||'info';log.appendChild(div);log.scrollTop=log.scrollHeight;}}catch(ex){}};
+  p2EvtSource.onerror=function(){if(p2EvtSource){p2EvtSource.close();p2EvtSource=null;}};
+}
 function stopReg(){
   fetch('/api/member/register/stop',{method:'POST',headers:auth()}).then(function(){
     G('btn-start').disabled=false;G('btn-stop').disabled=true;
@@ -257,24 +317,28 @@ function stopReg(){
   });
 }
 function connectLog(){
-  if(evtSource)evtSource.close();
+  if(evtSource){evtSource.close();evtSource=null;}
   var log=document.getElementById('mem-log');log.innerHTML='';
-  evtSource=new EventSource('/api/member/register/log?'+Math.random());
-  evtSource.setRequestHeader=function(){}; // EventSource doesn't support headers, use cookie token
-  // Use fetch-based SSE instead
-  evtSource.close();
-  var lastMsg='';
-  function poll(){
-    fetch('/api/member/register/log',{headers:{'Authorization':'Bearer '+TOKEN}}).then(function(r){
-      var reader=r.body.getReader();var decoder=new TextDecoder();
-      function read(){reader.read().then(function(d){if(d.done)return;var text=decoder.decode(d.value);var lines=text.split('\n');lines.forEach(function(l){if(l.startsWith('data: ')){try{var item=JSON.parse(l.substring(6));if(item.msg&&item.msg!=lastMsg){var div=document.createElement('div');div.innerHTML='<span class=time>'+item.time+'</span>'+item.msg;div.className=item.tag||'info';log.appendChild(div);log.scrollTop=log.scrollHeight;if(log.children.length>300)for(var i=0;i<50;i++)log.removeChild(log.firstChild);lastMsg=item.msg;}}}catch(e){}});read();});}
-      read();
-    });
-  }
-  // Simple SSE via EventSource with token in URL
-  evtSource=new EventSource('/api/member/register/log');
-  evtSource.onmessage=function(e){if(!e.data)return;try{var item=JSON.parse(e.data);if(item.msg){var div=document.createElement('div');div.innerHTML='<span class=time>'+item.time+'</span>'+item.msg;div.className=item.tag||'info';log.appendChild(div);log.scrollTop=log.scrollHeight;if(log.children.length>300)for(var i=0;i<50;i++)log.removeChild(log.firstChild);}}catch(ex){}};
-  evtSource.onerror=function(){G('btn-start').disabled=false;G('btn-stop').disabled=true;refreshMember();};
+  evtSource=new EventSource('/api/member/register/log?token='+TOKEN);
+  evtSource.onmessage=function(e){
+    if(!e.data)return;
+    try{
+      var item=JSON.parse(e.data);
+      if(item.msg){
+        var div=document.createElement('div');
+        div.innerHTML='<span class="time">'+item.time+'</span>'+item.msg;
+        div.className=item.tag||'info';
+        log.appendChild(div);
+        log.scrollTop=log.scrollHeight;
+        if(log.children.length>300){for(var i=0;i<50;i++)log.removeChild(log.firstChild);}
+      }
+    }catch(ex){}
+  };
+  evtSource.onerror=function(){
+    G('btn-start').disabled=false;
+    G('btn-stop').disabled=true;
+    refreshMember();
+  };
 }
 
 initView();

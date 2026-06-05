@@ -149,6 +149,35 @@ def api_history():
     return jsonify({"ok": True, "history": db.get_user_history(g.user_id)})
 
 
+@app.route("/api/member/accounts", methods=["GET"])
+@auth.login_required
+def api_accounts():
+    return jsonify({"ok": True, "accounts": db.get_user_accounts(g.user_id)})
+
+
+@app.route("/api/member/phase2/start", methods=["POST"])
+@auth.login_required
+def api_phase2_start():
+    """Phase 2 Only: 已有手机号+密码，直接跑 OAuth 绑邮箱+上传 SUB2API"""
+    d = request.json or {}
+    phone = d.get("phone", "").strip()
+    password = d.get("password", "").strip()
+    bind_email = d.get("bind_email", "").strip()
+    if not phone or not password or not bind_email:
+        return jsonify({"ok": False, "error": "手机号、密码、邮箱均必填"})
+    err = runner.start_phase2(g.user_id, phone, password, bind_email)
+    if err != "ok":
+        return jsonify({"ok": False, "error": err})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/member/phase2/stop", methods=["POST"])
+@auth.login_required
+def api_phase2_stop():
+    runner.stop_phase2(g.user_id)
+    return jsonify({"ok": True})
+
+
 # ── Admin routes ──
 @app.route("/api/admin/stats", methods=["GET"])
 @auth.admin_required
@@ -220,7 +249,7 @@ def api_logs():
 @auth.admin_required
 def api_assets():
     d = request.json or {}
-    for k in ["icloud_cookies", "mailmanage_key"]:
+    for k in ["icloud_cookies", "mailmanage_key", "msoutlook_helper_url"]:
         if k in d and d[k]:
             db.set_admin_asset(k, d[k])
     return jsonify({"ok": True})
@@ -230,13 +259,16 @@ def api_assets():
 @auth.admin_required
 def api_assets_get():
     return jsonify({"ok": True, "icloud_cookies": bool(db.get_admin_asset("icloud_cookies")),
-                     "mailmanage_key": bool(db.get_admin_asset("mailmanage_key"))})
+                     "mailmanage_key": bool(db.get_admin_asset("mailmanage_key")),
+                     "msoutlook_helper_url": bool(db.get_admin_asset("msoutlook_helper_url"))})
 
 
 # ── Start ──
 def start_server(host="0.0.0.0", port=8080):
     print(f"\nServer: http://127.0.0.1:{port}")
     print(f"Admin: {config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}")
+    import file_logger
+    file_logger.init()
     from scheduler import start_scheduler
     start_scheduler()
     app.run(host=host, port=port, debug=False, threaded=True)

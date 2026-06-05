@@ -2,6 +2,7 @@
 """ChatGPT Auto Register - Web GUI (Open Source Edition)"""
 
 import copy, json, os, queue, sys, threading, time
+import requests
 from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -10,8 +11,10 @@ from flask import Flask, request, jsonify, Response, send_file
 
 app = Flask(__name__)
 sys.path.insert(0, str(Path(__file__).parent))
+from phone_sms import PhoneSMS
 from smsbower import SmsBower
 import auto_register as ar
+import file_logger
 
 # ── Paths ──
 ROOT = Path(__file__).parent
@@ -19,6 +22,12 @@ COOKIES_FILE = ROOT / "icloud_cookies.json"
 BLACKLIST_FILE = ROOT / "email_blacklist.json"
 CONFIG_FILE = ROOT / "config.json"
 RESULTS_DIR = ROOT / "results"
+
+try:
+    from worker_control import create_worker_control_blueprint
+    app.register_blueprint(create_worker_control_blueprint(ROOT))
+except Exception as e:
+    print(f"[WARN] worker_control blueprint 注册失败: {e}")
 
 # ── Locks ──
 icloud_lock = threading.Lock()
@@ -60,12 +69,12 @@ def _load_config():
             saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             cfg = _state["config"]
             # 合并所有顶层简单字段
-            for k in ("proxy", "country", "service", "max_price", "sms_timeout",
+            for k in ("sms_provider", "proxy", "country", "service", "max_price", "sms_timeout",
                       "code_timeout", "bind_email"):
                 if k in saved:
                     cfg[k] = saved[k]
             # 合并嵌套对象
-            for section in ("smsbower", "register", "icloud", "sub2api"):
+            for section in ("smsbower", "hero_sms", "fivesim", "register", "icloud", "sub2api", "msoutlook"):
                 if section in saved and isinstance(saved[section], dict):
                     cfg.setdefault(section, {})
                     cfg[section].update(saved[section])
@@ -77,7 +86,10 @@ _state = {
     "results": [],
     "worker": None,               # {"thread": Thread, "stop": threading.Event}
     "config": {
+        "sms_provider": "smsbower",
         "smsbower": {"api_key": ""},
+        "hero_sms": {"api_key": "", "base_url": ""},
+        "fivesim": {"api_key": ""},
         "register": {"password": ""},
         "proxy": "",
         "country": "151",
@@ -88,6 +100,7 @@ _state = {
         "icloud": {"user": "", "pass": ""},
         "sub2api": {"url": "", "email": "", "pwd": "", "group": "CHATGPT", "proxy_id": 0},
         "bind_email": "",
+        "msoutlook": {"helper_url": "http://127.0.0.1:17373", "email": ""},
     },
     "log_queue": queue.Queue(),
     "log_lines": [],
@@ -95,6 +108,7 @@ _state = {
 }
 
 _load_config()
+file_logger.init(_state.get("config"))
 
 
 def _log(msg, tag="info", wid=1):
@@ -106,6 +120,10 @@ def _log(msg, tag="info", wid=1):
         _state["log_lines"].append(item)
         if len(_state["log_lines"]) > 2000:
             _state["log_lines"] = _state["log_lines"][-1500:]
+    try:
+        file_logger.write_log(tag, "web_gui", prefix + str(msg))
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -122,14 +140,19 @@ def api_config():
     if request.method == "POST":
         d = request.json or {}
         cfg = _state["config"]
-        for k in ["api_key", "proxy", "country", "max_price", "sms_timeout",
+        for k in ["sms_provider", "api_key", "hero_sms_key", "fivesim_key",
+                   "proxy", "country", "service", "max_price", "sms_timeout",
                    "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
-                   "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email"]:
+                   "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email",
+                   "msoutlook_helper_url", "msoutlook_email"]:
             if k in d and d[k] is not None:
-                if k == "api_key": cfg["smsbower"]["api_key"] = d[k]
+                if k == "sms_provider": cfg["sms_provider"] = d[k]
+                elif k == "api_key": cfg["smsbower"]["api_key"] = d[k]
+                elif k == "hero_sms_key": cfg["hero_sms"]["api_key"] = d[k]
+                elif k == "fivesim_key": cfg["fivesim"]["api_key"] = d[k]
                 elif k == "password": cfg["register"]["password"] = d[k]
                 elif k in ("sms_timeout",): cfg[k] = int(d[k]) if d[k] else 30
-                elif k in ("proxy", "country", "max_price"): cfg[k] = d[k]
+                elif k in ("proxy", "country", "service", "max_price"): cfg[k] = d[k]
                 elif k == "imap_user": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["user"] = d[k]
                 elif k == "imap_pass": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["pass"] = d[k]
                 elif k == "sub2api_url": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["url"] = d[k]
@@ -138,6 +161,8 @@ def api_config():
                 elif k == "sub2api_group": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["group"] = d[k]
                 elif k == "sub2api_proxy_id": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["proxy_id"] = int(d[k]) if d[k] else 0
                 elif k == "bind_email": cfg["bind_email"] = d[k]
+                elif k == "msoutlook_helper_url": cfg["msoutlook"] = cfg.get("msoutlook", {}); cfg["msoutlook"]["helper_url"] = d[k]
+                elif k == "msoutlook_email": cfg["msoutlook"] = cfg.get("msoutlook", {}); cfg["msoutlook"]["email"] = d[k]
         _save_config_file(cfg)
         return jsonify({"ok": True, "config": _sanitize_config(cfg)})
     return jsonify({"ok": True, "config": _sanitize_config(_state["config"])})
@@ -145,10 +170,13 @@ def api_config():
 
 @app.route("/api/balance")
 def api_balance():
-    key = _state.get("config", {}).get("smsbower", {}).get("api_key", "")
-    if not key: return jsonify({"ok": False, "error": "No API key"})
+    provider = _state.get("config", {}).get("sms_provider", "smsbower")
+    api_key = ar._get_sms_api_key(_state.get("config", {}), provider)
+    if not api_key: return jsonify({"ok": False, "error": "No API key"})
     try:
-        return jsonify({"ok": True, "balance": SmsBower(key).balance()})
+        sms = PhoneSMS(provider, api_key)
+        bal = sms.client.get_balance()
+        return jsonify({"ok": True, "balance": bal, "provider": provider})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
@@ -202,6 +230,54 @@ def api_download():
     path = ROOT / f"results_{ts}.json"
     path.write_text(json.dumps(safe, indent=2, ensure_ascii=False), encoding="utf-8")
     return send_file(path, as_attachment=True, download_name=path.name)
+
+
+@app.route("/api/msoutlook-stats")
+def api_msoutlook_stats():
+    """返回 MsOutlook 号池统计信息"""
+    helper_url = _state.get("config", {}).get("msoutlook", {}).get("helper_url", "")
+    if not helper_url:
+        return jsonify({"ok": False, "error": "未配置 MsOutlook"})
+    try:
+        from msoutlook_pool import MsOutlookPool
+        pool = MsOutlookPool(helper_url=helper_url, verbose=False)
+        s = pool.stats()
+        return jsonify({"ok": True, **s})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/msoutlook-import", methods=["POST"])
+def api_msoutlook_import():
+    """批量导入 MsOutlook 账号到号池"""
+    d = request.json or {}
+    text = d.get("text", "")
+    if not text.strip():
+        return jsonify({"ok": False, "error": "内容为空"})
+    try:
+        from msoutlook_pool import MsOutlookPool
+        result = MsOutlookPool.import_accounts(text)
+        if result["ok"] and result["added"] > 0:
+            _log(f"号池导入: 新增 {result['added']} 个，跳过 {result['skipped']} 个，总计 {result['total']}", "success")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/msoutlook-records")
+def api_msoutlook_records():
+    """返回 MsOutlook 号池使用记录"""
+    helper_url = _state.get("config", {}).get("msoutlook", {}).get("helper_url", "")
+    if not helper_url:
+        return jsonify({"ok": False, "error": "未配置 MsOutlook"})
+    try:
+        from msoutlook_pool import MsOutlookPool
+        pool = MsOutlookPool(helper_url=helper_url, verbose=False)
+        records = pool.get_records()
+        stats = pool.stats()
+        return jsonify({"ok": True, "records": records, "stats": stats})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/log-since/<int:cursor>")
@@ -260,6 +336,10 @@ class _WorkerLogIO:
             self._buf = self._buf[idx + 1:]
             if line:
                 _log(line, "info", 1)
+                try:
+                    file_logger.write_log("info", "auto_register", line)
+                except Exception:
+                    pass
 
     def flush(self):
         if self._buf.strip():
@@ -277,12 +357,14 @@ def _run(config, count, retries, stop_event):
 
     import contextlib
 
-    key = cfg.get("smsbower", {}).get("api_key", "")
-    sms = SmsBower(key)
-    try:
-        _log(f"余额: {sms.balance()}", "info", wid)
-    except Exception:
-        pass
+    provider = cfg.get("sms_provider", "smsbower")
+    api_key = ar._get_sms_api_key(cfg, provider)
+    if api_key:
+        try:
+            sms = PhoneSMS(provider, api_key)
+            _log(f"余额: {sms.client.get_balance()}  [平台:{provider}]", "info", wid)
+        except Exception as e:
+            _log(f"余额查询失败: {e}", "warn", wid)
 
     ok_count = 0
     attempt = 0
@@ -293,34 +375,78 @@ def _run(config, count, retries, stop_event):
     sub = cfg.get("sub2api", {})
     bind_email = cfg.get("bind_email", "")
 
-    # ── 获取 iCloud 邮箱 ──
+    # ── 加载所有已用邮箱：msoutlook_used.json + results/_all.json ──
+    _ms_used = set()
+    try:
+        from msoutlook_pool import load_used_set
+        _ms_used = load_used_set()
+    except Exception:
+        pass
+    try:
+        _all = json.loads((RESULTS_DIR / "_all.json").read_text())
+        for r in _all:
+            if r.get("bind_email"):
+                _ms_used.add(r["bind_email"].lower())
+    except Exception:
+        pass
+    if _ms_used:
+        _log(f"已用邮箱: {len(_ms_used)} 个（已过滤）", "info", wid)
+
+    # ── 获取邮箱 (优先 msoutlook, 其次 iCloud) ──
+    msoutlook_helper_url = cfg.get("msoutlook", {}).get("helper_url", "")
+    msoutlook_email_cfg = cfg.get("msoutlook", {}).get("email", "")
+
+    # ── 创建全局 MsOutlookPool 实例（整个 _run 生命周期复用）──
+    _ms_pool = None
+    if msoutlook_helper_url:
+        try:
+            from msoutlook_pool import MsOutlookPool
+            _ms_pool = MsOutlookPool(helper_url=msoutlook_helper_url, verbose=False, extra_used=_ms_used)
+        except Exception as e:
+            _log(f"MsOutlook号池初始化失败: {e}", "warn", wid)
+
     if not bind_email and sub.get("url"):
-        with icloud_lock:
+        # 优先 msoutlook
+        if _ms_pool:
             try:
-                cookies = _load_icloud_cookies()
-                if cookies:
-                    from icloud_hme import ICloudHME
-                    ic = ICloudHME(cookies, verbose=False)
-                    aliases = ic.list_aliases()
-                    with _blacklist_lock:
-                        bl_snapshot = set(_email_blacklist)
-                    with _claimed_lock:
-                        skip = bl_snapshot | _claimed_emails
-                        reuse = next((a for a in aliases if a.get("active") and not a.get("used")
-                                      and a["email"] not in skip), None)
-                    if reuse:
-                        bind_email = reuse["email"]
-                        _log(f"复用iCloud别名: {bind_email}", "info", wid)
-                    else:
-                        bind_email = ic.create_alias()
-                        _log(f"新iCloud别名: {bind_email}", "success", wid)
-                    if bind_email:
-                        with _claimed_lock:
-                            _claimed_emails.add(bind_email)
-                else:
-                    _log("iCloud cookies 未导入，跳过邮箱", "warn", wid)
+                ms_email = _ms_pool.get_available_email()
+                if ms_email:
+                    bind_email = ms_email
+                    cfg["msoutlook_email"] = ms_email
+                    _log(f"MsOutlook选中: {bind_email}", "info", wid)
+                    s = _ms_pool.stats()
+                    _log(f"号池: 可用{s['available']}/{s['total']}", "info", wid)
             except Exception as e:
-                _log(f"iCloud失败: {e}", "error", wid)
+                _log(f"MsOutlook失败: {e}，回退iCloud", "warn", wid)
+
+        # 回退 iCloud
+        if not bind_email:
+            with icloud_lock:
+                try:
+                    cookies = _load_icloud_cookies()
+                    if cookies:
+                        from icloud_hme import ICloudHME
+                        ic = ICloudHME(cookies, verbose=False)
+                        aliases = ic.list_aliases()
+                        with _blacklist_lock:
+                            bl_snapshot = set(_email_blacklist)
+                        with _claimed_lock:
+                            skip = bl_snapshot | _claimed_emails
+                            reuse = next((a for a in aliases if a.get("active") and not a.get("used")
+                                          and a["email"] not in skip), None)
+                        if reuse:
+                            bind_email = reuse["email"]
+                            _log(f"复用iCloud别名: {bind_email}", "info", wid)
+                        else:
+                            bind_email = ic.create_alias()
+                            _log(f"新iCloud别名: {bind_email}", "success", wid)
+                        if bind_email:
+                            with _claimed_lock:
+                                _claimed_emails.add(bind_email)
+                    else:
+                        _log("iCloud cookies 未导入，跳过邮箱", "warn", wid)
+                except Exception as e:
+                    _log(f"iCloud失败: {e}", "error", wid)
 
     if bind_email:
         cfg["bind_email"] = bind_email
@@ -332,9 +458,10 @@ def _run(config, count, retries, stop_event):
         _log(f"第{attempt}次 [{ok_count}/{count}]", "info", wid)
         try:
             with contextlib.redirect_stdout(_WorkerLogIO()):
-                result = ar.register_one(sms, cfg, verbose=True, step_retries=retries,
+                result = ar.register_one(cfg, verbose=True, step_retries=retries,
                                          create_account_max_retries=20,
-                                         max_price=cfg.get("max_price", ""))
+                                         max_price=cfg.get("max_price", ""),
+                                         auto_activate=False)
         except Exception as e:
             result = {"ok": False, "phone": "?", "error": str(e)}
 
@@ -349,9 +476,24 @@ def _run(config, count, retries, stop_event):
                 w["progress"] = f"{ok_count}/{count}"
             _log(f"成功: {result['phone']} -> {bind_email}", "success", wid)
 
+            # 记录 Phase 1 完成时间，用于判断超时
+            phase1_done_time = time.time()
+
             # ── Phase 2: OAuth + 绑邮箱 + 上传 ──
             phase2_ok = True
-            if sub.get("url") and sub.get("email") and result.get("session_token") and bind_email:
+            _phase2_skip_reason = None
+            if not sub.get("url"):
+                _phase2_skip_reason = "未配置 SUB2API URL"
+            elif not sub.get("email"):
+                _phase2_skip_reason = "未配置 SUB2API 邮箱"
+            elif not result.get("session_token"):
+                _phase2_skip_reason = "session_token 为空（可能被 Cloudflare 拦截或 Cookie 丢失）"
+            elif not bind_email:
+                _phase2_skip_reason = "bind_email 为空"
+
+            if _phase2_skip_reason:
+                _log(f"  [跳过 Phase 2] {_phase2_skip_reason}", "warn", wid)
+            elif sub.get("url") and sub.get("email") and result.get("session_token") and bind_email:
                 if w: w["status"] = "🔄 Phase2: OAuth绑邮箱"
                 _log("=== Phase 2: OAuth + 绑邮箱 + 上传 ===", "info", wid)
                 phase2_ok = False
@@ -425,6 +567,8 @@ def _run(config, count, retries, stop_event):
                             sub2api_session_id=session_id,
                             sub2api_state=oauth_state,
                             sub2api_proxy_id=int(cfg.get("sub2api", {}).get("proxy_id", 0) or 0),
+                            msoutlook_helper_url=cfg.get("msoutlook", {}).get("helper_url", "") if (_ms_pool and _ms_pool.get_account(_current_email)) else "",
+                            msoutlook_email=_current_email,
                         )
                         if oauth_result.get("ok"):
                             break
@@ -471,16 +615,194 @@ def _run(config, count, retries, stop_event):
                                 break
 
                     if oauth_result and oauth_result.get("ok"):
+                        # Phase 2 成功 — 邮箱已被 OpenAI 绑定，立即 mark_used 永久废弃，
+                        # 防止下一轮注册复用同一个邮箱（会触发 email_already_in_use）。
+                        if _ms_pool and bind_email:
+                            try:
+                                _ms_pool.mark_used(bind_email, phone=result.get("phone", ""))
+                                _log(f"  [邮箱] 已标记占用: {bind_email}", "info", wid)
+                            except Exception as e:
+                                _log(f"  [邮箱] mark_used 失败: {e}", "warn", wid)
+
+                        # Phase 2 成功，激活号码 (status=6)
+                        activation_id = result.get("activation_id", "")
+                        if activation_id:
+                            try:
+                                _sms_provider = cfg.get("sms_provider", "smsbower")
+                                _sms_key = ar._get_sms_api_key(cfg, _sms_provider)
+                                _sms = PhoneSMS(_sms_provider, _sms_key)
+                                _sms.complete(activation_id)
+                                _log(f"  [激活] 号码已激活 (status=6): {result.get('phone','?')}", "success", wid)
+                            except Exception as e:
+                                _log(f"  [激活] 激活失败: {e}", "error", wid)
+
                         phase2_ok = True
                         aid = oauth_result.get("sub2api_account_id", "?")
                         if w: w["status"] = f"✅ 完成 SUB2API#{aid}"
                         _log(f"  [4/4] 上传成功! SUB2API id={aid}", "success", wid)
                         result["sub2api_id"] = aid
                     else:
+                        err = oauth_result.get("error", "") if oauth_result else ""
+                        activation_id = result.get("activation_id", "")
+
+                        # 判断超时
+                        elapsed = time.time() - phase1_done_time
+
+                        if "email_already_in_use" in err:
+                            # 邮箱已绑定，进入循环换邮箱重试 Phase 2（不重跑 Phase 1）
+                            if activation_id:
+                                try:
+                                    _sms_provider = cfg.get("sms_provider", "smsbower")
+                                    _sms_key = ar._get_sms_api_key(cfg, _sms_provider)
+                                    _sms = PhoneSMS(_sms_provider, _sms_key)
+                                    _sms.resend(activation_id)
+                                    _log(f"  [重发] 请求重发短信 (status=3): {result.get('phone','?')}", "warn", wid)
+                                except Exception as e:
+                                    _log(f"  [重发] 请求失败: {e}", "error", wid)
+
+                            # 循环换邮箱重试 Phase 2
+                            _max_ms_retries = 10
+                            _ms_retry = 0
+                            _retry_phase2_ok = False
+
+                            while _ms_retry < _max_ms_retries:
+                                _ms_retry += 1
+
+                                # 废弃旧邮箱
+                                if _ms_pool and bind_email:
+                                    try:
+                                        _ms_pool.mark_error(bind_email, "email_already_in_use")
+                                        _log(f"Phase2失败（邮箱已被占用，永久废弃）: {bind_email}", "warn", wid)
+                                    except Exception as e:
+                                        _log(f"标记邮箱失败: {e}", "warn", wid)
+
+                                # 选新邮箱
+                                try:
+                                    new_email = _ms_pool.get_available_email() if _ms_pool else None
+                                    if new_email:
+                                        bind_email = new_email
+                                        cfg["bind_email"] = new_email
+                                        cfg["msoutlook_email"] = new_email
+                                        _ms_pool.mark_used(new_email)
+                                        _log(f"  [重试{_ms_retry}] 选新邮箱: {new_email}，继续 Phase 2...", "info", wid)
+                                    else:
+                                        _log("  [重试] 号池无可用邮箱", "error", wid)
+                                        new_email = None
+                                except Exception as e:
+                                    _log(f"  [重试] 选邮箱失败: {e}", "error", wid)
+                                    new_email = None
+
+                                if not new_email:
+                                    break
+
+                                # 重做 Phase 2
+                                try:
+                                    _log("  [重试] OAuth流程: 登录->绑邮箱->验证->同意->code ...", "info", wid)
+                                    _r = requests.post(f"{sub['url']}/api/v1/auth/login",
+                                              json={"email": sub["email"], "password": sub.get("pwd", "")}, timeout=15)
+                                    login_data = _r.json()
+                                    if login_data.get("code") != 0:
+                                        raise RuntimeError(f"SUB2API登录失败: {login_data}")
+                                    admin_token = login_data["data"]["access_token"]
+
+                                    _r = requests.post(f"{sub['url']}/api/v1/admin/openai/generate-auth-url",
+                                              json={"redirect_uri": "http://localhost:1455/auth/callback"},
+                                              headers={"Authorization": f"Bearer {admin_token}"}, timeout=30)
+                                    oauth_data = _r.json()
+                                    if oauth_data.get("code") != 0:
+                                        raise RuntimeError(f"获取OAuth URL失败: {oauth_data}")
+                                    oauth_url = oauth_data["data"]["auth_url"]
+                                    session_id = oauth_data["data"]["session_id"]
+                                    oauth_state = _up.parse_qs(_up.urlparse(oauth_url).query).get("state", [""])[0]
+
+                                    from openai_bind_email import run_second_half
+                                    oauth_result = run_second_half(
+                                        oauth_url=oauth_url,
+                                        phone=result["phone"],
+                                        password=result["password"],
+                                        icloud_email=new_email,
+                                        icloud_cookies={},
+                                        imap_user=cfg.get("icloud", {}).get("user", ""),
+                                        imap_password=cfg.get("icloud", {}).get("pass", ""),
+                                        sub2api_url=sub["url"],
+                                        sub2api_email=sub["email"],
+                                        sub2api_password=sub.get("pwd", ""),
+                                        proxy=cfg.get("proxy", ""),
+                                        verbose=True,
+                                        sub2api_session_id=session_id,
+                                        sub2api_state=oauth_state,
+                                        sub2api_proxy_id=int(cfg.get("sub2api", {}).get("proxy_id", 0) or 0),
+                                        msoutlook_helper_url=cfg.get("msoutlook", {}).get("helper_url", "") if (_ms_pool and _ms_pool.get_account(new_email)) else "",
+                                        msoutlook_email=new_email,
+                                    )
+                                    if oauth_result and oauth_result.get("ok"):
+                                        _retry_phase2_ok = True
+                                        phase2_ok = True
+                                        aid = oauth_result.get("sub2api_account_id", "?")
+                                        if w: w["status"] = f"✅ 完成 SUB2API#{aid}"
+                                        _log(f"  [重试成功] 上传成功! SUB2API id={aid}", "success", wid)
+                                        result["sub2api_id"] = aid
+                                        # 记录绑定手机号
+                                        if _ms_pool:
+                                            _ms_pool.mark_used(bind_email, phone=result.get("phone", ""))
+                                        # 激活号码
+                                        if activation_id:
+                                            try:
+                                                _sms2 = PhoneSMS(_sms_provider, _sms_key)
+                                                _sms2.complete(activation_id)
+                                            except Exception:
+                                                pass
+                                        break  # 成功，退出重试循环
+                                    err = oauth_result.get("error", "") if oauth_result else ""
+                                    if "email_already_in_use" in err:
+                                        _log(f"  [3/4] 邮箱再次被占用: {new_email}", "warn", wid)
+                                        continue  # 继续下一轮换邮箱
+                                    # 其他错误，退出重试循环
+                                    _log(f"  [重试] Phase 2 失败: {err}", "error", wid)
+                                    break
+                                except Exception as retry_err:
+                                    _log(f"  [重试] Phase 2 error: {retry_err}", "error", wid)
+                                    break
+
+                            if not _retry_phase2_ok:
+                                _log(f"  [重试] 换邮箱重试全部失败", "error", wid)
+
+                    # 最终检查：无论成功失败，总耗时 > 2.5 分钟则取消激活（避免浪费）
+                    elapsed = time.time() - phase1_done_time
+                    _log(f"  Phase2耗时: {elapsed:.0f}s", "info", wid)
+                    if elapsed > 150 and not phase2_ok:
+                        activation_id = result.get("activation_id", "")
+                        if activation_id:
+                            try:
+                                _sms_provider = cfg.get("sms_provider", "smsbower")
+                                _sms_key = ar._get_sms_api_key(cfg, _sms_provider)
+                                _sms = PhoneSMS(_sms_provider, _sms_key)
+                                _sms.cancel(activation_id)
+                                _log(f"  [取消] 超时 {elapsed:.0f}s，号码释放 (status=8): {result.get('phone','?')}", "warn", wid)
+                            except Exception as e:
+                                _log(f"  [取消] 释放失败: {e}", "error", wid)
+                    if not phase2_ok:
                         if w: w["status"] = "❌ Phase2失败"
-                        _log(f"  [4/4] OAuth失败: {oauth_result.get('error','?') if oauth_result else 'no result'}", "error", wid)
+                        _log(f"  [4/4] OAuth失败: {err}", "error", wid)
                 except Exception as e:
                     _log(f"Phase 2 error: {e}", "error", wid)
+                    # 异常时也取消激活
+                    activation_id = result.get("activation_id", "")
+                    if activation_id:
+                        try:
+                            _sms_provider = cfg.get("sms_provider", "smsbower")
+                            _sms_key = ar._get_sms_api_key(cfg, _sms_provider)
+                            _sms = PhoneSMS(_sms_provider, _sms_key)
+                            _sms.cancel(activation_id)
+                            _log(f"  [取消] 号码已释放: {result.get('phone','?')}", "warn", wid)
+                        except Exception:
+                            pass
+                    # 异常时也恢复邮箱
+                    if _ms_pool and bind_email:
+                        try:
+                            _ms_pool.mark_unused(bind_email)
+                        except Exception:
+                            pass
 
             _save_result(result, cfg)
         else:
@@ -517,8 +839,13 @@ def _save_result(result: dict, config: dict):
     safe["bind_email"] = config.get("bind_email", "")
     ts = time.strftime("%Y%m%d_%H%M%S")
     phone = result.get("phone", "unknown").replace("+", "")
+    # 确保目录存在
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = RESULTS_DIR / f"{phone}_{ts}.json"
-    path.write_text(json.dumps(safe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        path.write_text(json.dumps(safe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as e:
+        _log(f"[保存] 写入 {path} 失败: {e}", "error", None)
     all_path = RESULTS_DIR / "_all.json"
     with _result_lock:
         all_results = []
@@ -528,7 +855,10 @@ def _save_result(result: dict, config: dict):
             except Exception:
                 pass
         all_results.append(safe)
-        all_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            all_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception as e:
+            _log(f"[保存] 写入 {all_path} 失败: {e}", "error", None)
 
 
 def _sanitize_config(cfg):
@@ -591,8 +921,21 @@ hr{border-color:#e0cda7;margin:8px 0}
 <div class="sidebar">
   <h2>ChatGPT Auto Register</h2>
 
+  <label>接码平台</label>
+  <select id="sms_provider">
+    <option value="smsbower">SMSBower</option>
+    <option value="hero-sms">Hero-SMS</option>
+    <option value="5sim">5Sim</option>
+  </select>
+
   <label>SMSBower Key</label>
   <input id="api_key" placeholder="your-smsbower-key">
+
+  <label>Hero-SMS Key</label>
+  <input id="hero_sms_key" placeholder="your-hero-sms-key">
+
+  <label>5Sim Key</label>
+  <input id="fivesim_key" placeholder="your-5sim-key">
 
   <label>代理</label>
   <input id="proxy" placeholder="socks5h://127.0.0.1:10808">
@@ -629,6 +972,23 @@ hr{border-color:#e0cda7;margin:8px 0}
     <input id="sub2api_pwd" type="password" placeholder="">
     <label>绑定邮箱 (手动指定)</label>
     <input id="bind_email" placeholder="alias@icloud.com">
+  </details>
+
+  <details style="margin-top:6px">
+    <summary>MsOutlook 号池</summary>
+    <label>Hotmail Helper URL</label>
+    <input id="msoutlook_helper_url" value="http://127.0.0.1:17373">
+    <label>指定邮箱 (留空=自动选)</label>
+    <input id="msoutlook_email" placeholder="自动从号池选">
+    <span id="msoutlook_stats" style="font-size:11px;color:#2e7d32;display:block;margin:4px 0"></span>
+    <label>批量导入 (账号----密码----ID----Token，每行一个)</label>
+    <textarea id="msoutlook_import_text" rows="5" style="font-size:11px;font-family:Consolas,monospace" placeholder="email@example.test----password----id----refreshToken"></textarea>
+    <div class="btn-row">
+      <button class="btn-neutral" onclick="importMsOutlook()">导入号池</button>
+      <button class="btn-neutral" onclick="loadMsOutlookRecords()">查看记录</button>
+      <span id="msoutlook_import_status" style="font-size:11px;color:#8b6f4e;line-height:2.4"></span>
+    </div>
+    <div id="msoutlook_records" style="display:none;margin-top:6px;max-height:200px;overflow-y:auto;font-size:11px;background:#fffbf5;border:1px solid #e8d5b0;border-radius:4px;padding:6px"></div>
   </details>
 
   <details style="margin-top:6px">
@@ -694,23 +1054,32 @@ function pollLog(){
 setInterval(pollLog,800);
 
 function saveConfig(){
-  var d={api_key:G('api_key').value,proxy:G('proxy').value,country:G('country').value,
+  var d={sms_provider:G('sms_provider').value,api_key:G('api_key').value,hero_sms_key:G('hero_sms_key').value,fivesim_key:G('fivesim_key').value,
+    proxy:G('proxy').value,country:G('country').value,
     password:G('password').value,max_price:G('max_price').value,
     sms_timeout:G('sms_timeout').value,
     imap_user:G('imap_user').value,imap_pass:G('imap_pass').value,
     sub2api_url:G('sub2api_url').value,sub2api_email:G('sub2api_email').value,
-    sub2api_pwd:G('sub2api_pwd').value,bind_email:G('bind_email').value};
+    sub2api_pwd:G('sub2api_pwd').value,bind_email:G('bind_email').value,
+    msoutlook_helper_url:G('msoutlook_helper_url').value,msoutlook_email:G('msoutlook_email').value};
   return fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
     .then(function(r){return r.json()}).then(function(j){toast('配置已保存',j.ok);return j;});
 }
 
 function checkBalance(){
   var btn=G('btn-balance');var orig=btn.textContent;btn.disabled=true;btn.innerHTML='<span class=spin></span>查询中';
-  fetch('/api/balance').then(function(r){return r.json()}).then(function(j){
-    if(j.ok){G('balance').textContent=j.balance.replace('ACCESS_BALANCE:','');toast('余额: '+j.balance.replace('ACCESS_BALANCE:',''),true);}
-    else{toast('查询失败: '+j.error,false);}
-    btn.disabled=false;btn.textContent=orig;
-  }).catch(function(){btn.disabled=false;btn.textContent=orig;toast('网络错误',false);});
+  saveConfig().then(function(){
+    fetch('/api/balance').then(function(r){return r.json()}).then(function(j){
+      if(j.ok){
+        var bal = j.balance;
+        if(typeof bal === 'string' && bal.indexOf('ACCESS_BALANCE:')===0) bal=bal.replace('ACCESS_BALANCE:','');
+        G('balance').textContent=bal;
+        toast('余额: '+bal, true);
+      }
+      else{toast('查询失败: '+j.error,false);}
+      btn.disabled=false;btn.textContent=orig;
+    });
+  });
 }
 
 function startReg(){
@@ -783,7 +1152,10 @@ function loadConfig(){
   fetch('/api/config').then(function(r){return r.json()}).then(function(j){
     if(!j.ok)return;
     var c=j.config;
+    G('sms_provider').value=c.sms_provider||'smsbower';
     if(c.smsbower) G('api_key').value=c.smsbower.api_key||'';
+    if(c.hero_sms) G('hero_sms_key').value=c.hero_sms.api_key||'';
+    if(c.fivesim) G('fivesim_key').value=c.fivesim.api_key||'';
     G('proxy').value=c.proxy||'';
     G('country').value=c.country||'151';
     G('max_price').value=c.max_price||'';
@@ -799,12 +1171,71 @@ function loadConfig(){
       G('sub2api_pwd').value=c.sub2api.pwd||'';
     }
     G('bind_email').value=c.bind_email||'';
+    if(c.msoutlook){
+      G('msoutlook_helper_url').value=c.msoutlook.helper_url||'http://127.0.0.1:17373';
+      G('msoutlook_email').value=c.msoutlook.email||'';
+    }
+    loadMsOutlookStats();
     checkBalance();
   });
 }
 
 loadConfig();
 loadCookiesStatus();
+
+function loadMsOutlookStats(){
+  fetch('/api/msoutlook-stats').then(function(r){return r.json()}).then(function(j){
+    if(j.ok){
+      G('msoutlook_stats').textContent='号池: 可用'+j.available+'/'+j.total+' 已用'+j.used+' 错误'+j.error;
+    }
+  });
+}
+
+function importMsOutlook(){
+  var text=G('msoutlook_import_text').value.trim();
+  if(!text){toast('请粘贴导入内容',false);return;}
+  var btn=event.target;btn.disabled=true;btn.textContent='导入中...';
+  fetch('/api/msoutlook-import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text})})
+    .then(function(r){return r.json()}).then(function(j){
+      btn.disabled=false;btn.textContent='导入号池';
+      if(j.ok){
+        G('msoutlook_import_status').textContent='新增 '+j.added+' 跳过 '+j.skipped+' 总计 '+j.total;
+        G('msoutlook_import_status').style.color='#2e7d32';
+        toast('导入完成: 新增 '+j.added+' 个',true);
+        G('msoutlook_import_text').value='';
+        loadMsOutlookStats();
+      }else{
+        G('msoutlook_import_status').textContent=j.error;
+        G('msoutlook_import_status').style.color='#c62828';
+        toast(j.error,false);
+      }
+    }).catch(function(){btn.disabled=false;btn.textContent='导入号池';toast('网络错误',false);});
+}
+
+function loadMsOutlookRecords(){
+  var el=G('msoutlook_records');
+  if(el.style.display!=='none'){el.style.display='none';return;}
+  fetch('/api/msoutlook-records').then(function(r){return r.json()}).then(function(j){
+    if(!j.ok){toast(j.error||'加载失败',false);return;}
+    var records=j.records||{};
+    var keys=Object.keys(records);
+    if(!keys.length){el.innerHTML='<div style="color:#8b6f4e">暂无记录</div>';el.style.display='block';return;}
+    var h='<table style="width:100%;border-collapse:collapse;font-size:11px">';
+    h+='<tr style="border-bottom:1px solid #e8d5b0"><th style="text-align:left;padding:2px 4px">邮箱</th><th style="text-align:left;padding:2px 4px">状态</th><th style="text-align:left;padding:2px 4px">手机号</th><th style="text-align:left;padding:2px 4px">错误</th><th style="text-align:left;padding:2px 4px">时间</th></tr>';
+    keys.sort().forEach(function(email){
+      var r=records[email];
+      var sc=r.status==='used'?'color:#2e7d32':'color:#c62828';
+      var phone=r.phone||'-';
+      var err=r.error?'<span style="color:#c62828">'+r.error+'</span>':'-';
+      var short=email.split('@')[0];
+      if(short.length>12)short=short.substring(0,12)+'..';
+      h+='<tr style="border-bottom:1px solid #f0e4d0"><td style="padding:2px 4px" title="'+email+'">'+short+'</td><td style="padding:2px 4px;'+sc+'">'+r.status+'</td><td style="padding:2px 4px">'+phone+'</td><td style="padding:2px 4px">'+err+'</td><td style="padding:2px 4px;color:#aaa">'+(r.used_at||'').replace('T',' ').substring(0,16)+'</td></tr>';
+    });
+    h+='</table>';
+    el.innerHTML=h;
+    el.style.display='block';
+  });
+}
 </script></body></html>"""
 
 if __name__ == "__main__":
