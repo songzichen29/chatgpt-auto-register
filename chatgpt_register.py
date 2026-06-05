@@ -198,7 +198,7 @@ class ChatGPTRegister:
             data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
             data = {}
-        data["_status"] = r.status_code if r else 0
+        data["_status"] = r.status_code if r is not None else 0
         return data
 
     # ---- Step 6: 发送手机验证码 ----
@@ -265,10 +265,12 @@ class ChatGPTRegister:
                 headers=headers,
                 timeout=30,
             )
-            data = r.json() if r.ok else {}
+            ct = r.headers.get("content-type", "") if r is not None else ""
+            data = r.json() if ct.startswith("application/json") else {}
         except Exception:
             data = {}
-        data["_status"] = r.status_code if r else 0
+        data["_status"] = r.status_code if r is not None else 0
+        data["_body"] = r.text[:500] if r is not None and r.text else ""
         return data
 
     # ---- Step 8: 创建账户 (用户名+生日) ----
@@ -298,8 +300,8 @@ class ChatGPTRegister:
             data = r.json() if ct.startswith("application/json") else {}
         except Exception:
             data = {}
-        data["_status"] = r.status_code if r else 0
-        data["_body"] = r.text[:500] if r and r.text else ""
+        data["_status"] = r.status_code if r is not None else 0
+        data["_body"] = r.text[:500] if r is not None and r.text else ""
         return data
 
     # ---- 访问 about-you 页面建立会话 ----

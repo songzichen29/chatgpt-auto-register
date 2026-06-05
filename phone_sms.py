@@ -158,8 +158,10 @@ class HeroSMS:
         timeout: int = 180,
         interval: int = 5,
         verbose: bool = True,
+        exclude_codes: Optional[List[str]] = None,
     ) -> Optional[str]:
         """轮询等待验证码，超时返回 None"""
+        excluded = {str(code).strip() for code in (exclude_codes or []) if str(code).strip()}
         start = time.time()
         _net_errors = 0  # 连续网络错误计数
         while time.time() - start < timeout:
@@ -183,6 +185,11 @@ class HeroSMS:
 
             if status.startswith("STATUS_OK:"):
                 code = status.split(":", 1)[1]
+                if code in excluded:
+                    if verbose:
+                        print(f"  [hero-sms] 忽略旧验证码: {code}")
+                    time.sleep(interval)
+                    continue
                 return code
             elif status == "STATUS_CANCEL":
                 return None
@@ -293,8 +300,10 @@ class FiveSim:
         timeout: int = 180,
         interval: int = 5,
         verbose: bool = True,
+        exclude_codes: Optional[List[str]] = None,
     ) -> Optional[str]:
         """轮询等待验证码"""
+        excluded = {str(code).strip() for code in (exclude_codes or []) if str(code).strip()}
         start = time.time()
         _net_errors = 0
         while time.time() - start < timeout:
@@ -319,12 +328,18 @@ class FiveSim:
                 text = str(msg.get("text", "") or msg.get("sms", "") or "")
                 code = msg.get("code", "")
                 if code:
-                    return str(code)
+                    code = str(code)
+                    if code in excluded:
+                        continue
+                    return code
                 # 尝试从文本提取 6 位数字
                 import re
                 match = re.search(r"\b(\d{6})\b", text)
                 if match:
-                    return match.group(1)
+                    code = match.group(1)
+                    if code in excluded:
+                        continue
+                    return code
 
             time.sleep(interval)
 
@@ -411,15 +426,21 @@ class PhoneSMS:
         activation_id: str = None,
         timeout: int = 180,
         verbose: bool = True,
+        exclude_codes: Optional[List[str]] = None,
     ) -> Optional[str]:
         aid = activation_id or self._activation_id
         if not aid:
             raise RuntimeError("No active activation")
-        return self.client.wait_for_code(aid, timeout=timeout, verbose=verbose)
+        return self.client.wait_for_code(aid, timeout=timeout, verbose=verbose, exclude_codes=exclude_codes)
 
-    def wait_code(self, timeout: int = 300, interval: int = 3) -> Optional[str]:
+    def wait_code(
+        self,
+        timeout: int = 300,
+        interval: int = 3,
+        exclude_codes: Optional[List[str]] = None,
+    ) -> Optional[str]:
         """SmsBower 兼容别名：轮询等待验证码"""
-        return self.wait_for_code(timeout=timeout)
+        return self.wait_for_code(timeout=timeout, exclude_codes=exclude_codes)
 
     def cancel(self, activation_id: str = None, min_hold: Optional[float] = None) -> float:
         """请求取消激活。考虑 hero-sms / SmsBower 协议的 150s 冷却期。

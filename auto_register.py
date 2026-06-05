@@ -236,6 +236,7 @@ def register_one(
 
         # 校验验证码，失败时通过 status=3 重发短信并重试
         _last_otp_error = ""
+        used_otp_codes = {str(code).strip()} if code else set()
         for otp_attempt in range(otp_max_retries):
             result = _retry_call(lambda c=code: reg.validate_otp(c), sr, label="校验验证码")
             continue_url = result.get("continue_url", "")
@@ -243,16 +244,20 @@ def register_one(
                 break  # 校验成功，跳出循环
 
             # 校验失败：请求 SMS 平台重发短信 (status=3)，复用同一号码
+            detail = result.get("_body") or ""
             _last_otp_error = f"验证码校验失败(status={result.get('_status')})"
+            if detail:
+                _last_otp_error += f": {detail[:160]}"
             if otp_attempt < otp_max_retries - 1:
                 sms.resend()
                 _retry_call(lambda: reg.send_otp(send_otp_url), sr, label="重新发送验证码")
                 if verbose:
                     print(f"  {_last_otp_error}，[OTP重试 {otp_attempt + 1}/{otp_max_retries - 1}] 已请求重发验证码到 {phone}")
-                code = sms.wait_code(timeout=config["code_timeout"])
+                code = sms.wait_code(timeout=config["code_timeout"], exclude_codes=list(used_otp_codes))
                 if not code:
                     _last_otp_error = "重发后验证码超时"
                     break  # 重发后仍收不到，不再继续
+                used_otp_codes.add(str(code).strip())
                 if verbose:
                     print(f"  收到验证码: {code}")
             else:
