@@ -326,89 +326,41 @@ class ChatGPTRegister:
     # ---- Step 7: 验证 OTP 验证码 ----
     def validate_otp(self, code: str) -> dict:
         self._log(7, "POST /api/accounts/phone-otp/validate ...")
-        headers = {
-            **COMMON_HEADERS,
-            "referer": f"{AUTH}/contact-verification",
-            "oai-device-id": self.device_id,
-        }
-        try:
-            self._add_sentinel_headers(headers, "authorize_continue")
-        except Exception:
-            pass
-
-        # 恢复 80de48b 的关键行为：OTP validate 前重建连接，但保留 Cookie。
-        # 这条链路对 auth 状态很敏感；只复用当前连接时，后续 create_account
-        # 容易出现 invalid_state。
-        self._rebuild_session()
-
-        r = None
-        error = ""
-        try:
-            r = self.session.post(
-                f"{AUTH}/api/accounts/phone-otp/validate",
-                json={"code": code},
-                headers=headers,
-                timeout=30,
-            )
-            ct = r.headers.get("content-type", "") if r is not None else ""
-            data = r.json() if ct.startswith("application/json") else {}
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            data = {}
-        data["_status"] = r.status_code if r is not None else 0
-        data["_body"] = r.text[:500] if r is not None and r.text else ""
-        if error:
-            data["_error"] = error[:500]
-        return data
+        # 折中稳定版：
+        # - 保留 80de48b 的 authorize_continue Sentinel，避免 auth step 状态不完整；
+        # - 不再手写先生成 header 再 _rebuild_session 的旧流程，避免重新引入 curl 55；
+        # - 交给统一 fallback：第一枪当前会话，传输层失败时 rebuild + HTTP/1.1。
+        return self._post_auth_json_with_fallback(
+            "/api/accounts/phone-otp/validate",
+            {"code": code},
+            referer=f"{AUTH}/contact-verification",
+            flow="authorize_continue",
+        )
 
     # ---- Step 8: 创建账户 (用户名+生日) ----
     def create_account(self, name: str, birthdate: str) -> dict:
         self._log(8, "POST /api/accounts/create_account ...")
-        headers = {
-            **COMMON_HEADERS,
-            "referer": f"{AUTH}/about-you",
-            "oai-device-id": self.device_id,
-        }
-        try:
-            self._add_sentinel_headers(headers, "oauth_create_account")
-        except Exception:
-            pass
-
-        # 同样恢复旧实现：create_account 前重建连接，避免复用失效连接上下文。
-        self._rebuild_session()
-
-        r = None
-        error = ""
-        try:
-            r = self.session.post(
-                f"{AUTH}/api/accounts/create_account",
-                json={"name": name, "birthdate": birthdate},
-                headers=headers,
-                allow_redirects=False,
-                timeout=30,
-            )
-            ct = r.headers.get("content-type", "") if r is not None else ""
-            data = r.json() if ct.startswith("application/json") else {}
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            data = {}
-        data["_status"] = r.status_code if r is not None else 0
-        data["_body"] = r.text[:500] if r is not None and r.text else ""
-        if error:
-            data["_error"] = error[:500]
-        return data
+        return self._post_auth_json_with_fallback(
+            "/api/accounts/create_account",
+            {"name": name, "birthdate": birthdate},
+            referer=f"{AUTH}/about-you",
+            flow="oauth_create_account",
+            allow_redirects=False,
+        )
 
     # ---- 访问 about-you 页面建立会话 ----
     def visit_about_you(self, continue_url: str):
         if self.verbose:
             print("  [^^] 访问 about-you 页面 ...")
         url = continue_url if continue_url.startswith("http") else f"{AUTH}{continue_url}"
-        self.session.get(
+        r = self.session.get(
             url,
             headers={**NAVIGATE_HEADERS, "referer": f"{AUTH}/contact-verification", "sec-fetch-site": "same-origin"},
             allow_redirects=True,
             timeout=30,
         )
+        if self.verbose:
+            print(f"  [^^] about-you status={getattr(r, 'status_code', '?')} url={getattr(r, 'url', url)}")
 
     # ---- Step 9: OAuth 回调获取 session token ----
     def oauth_callback(self, callback_url: str) -> str:

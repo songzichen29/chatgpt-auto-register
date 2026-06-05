@@ -16,76 +16,85 @@ import worker_pool
 
 
 class WorkerPoolComponentTests(unittest.TestCase):
-    def test_validate_otp_uses_authorize_continue_with_rebuild(self):
+    def test_validate_otp_uses_authorize_continue_fallback(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
-        calls = {"sentinel": [], "rebuild": 0, "post": []}
+        calls = []
 
-        class FakeResponse:
-            status_code = 200
-            headers = {"content-type": "application/json"}
-            text = '{"continue_url": "/about-you"}'
+        def fake_post(path, payload, **kwargs):
+            calls.append((path, payload, kwargs))
+            return {"continue_url": "/about-you", "_status": 200}
 
-            def json(self):
-                return {"continue_url": "/about-you"}
-
-        class FakeSession:
-            def post(self, url, **kwargs):
-                calls["post"].append((url, kwargs))
-                return FakeResponse()
-
-        def fake_sentinel(headers, flow):
-            calls["sentinel"].append(flow)
-            headers["OpenAI-Sentinel-Token"] = "sentinel-token"
-
-        reg.session = FakeSession()
-        reg._add_sentinel_headers = fake_sentinel
-        reg._rebuild_session = lambda: calls.__setitem__("rebuild", calls["rebuild"] + 1)
+        reg._post_auth_json_with_fallback = fake_post
         result = reg.validate_otp("123456")
 
         self.assertEqual(result["continue_url"], "/about-you")
-        self.assertEqual(calls["sentinel"], ["authorize_continue"])
-        self.assertEqual(calls["rebuild"], 1)
-        self.assertEqual(calls["post"][0][0], "https://auth.openai.com/api/accounts/phone-otp/validate")
-        self.assertEqual(calls["post"][0][1]["json"], {"code": "123456"})
-        self.assertEqual(calls["post"][0][1]["headers"]["OpenAI-Sentinel-Token"], "sentinel-token")
+        self.assertEqual(calls[0][0], "/api/accounts/phone-otp/validate")
+        self.assertEqual(calls[0][1], {"code": "123456"})
+        self.assertEqual(calls[0][2]["flow"], "authorize_continue")
+        self.assertEqual(calls[0][2]["referer"], "https://auth.openai.com/contact-verification")
 
-    def test_create_account_uses_oauth_create_account_with_rebuild(self):
+    def test_create_account_uses_oauth_create_account_fallback(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
-        calls = {"sentinel": [], "rebuild": 0, "post": []}
+        calls = []
 
-        class FakeResponse:
-            status_code = 200
-            headers = {"content-type": "application/json"}
-            text = '{"continue_url": "https://callback.example"}'
+        def fake_post(path, payload, **kwargs):
+            calls.append((path, payload, kwargs))
+            return {"continue_url": "https://callback.example", "_status": 200}
 
-            def json(self):
-                return {"continue_url": "https://callback.example"}
-
-        class FakeSession:
-            def post(self, url, **kwargs):
-                calls["post"].append((url, kwargs))
-                return FakeResponse()
-
-        def fake_sentinel(headers, flow):
-            calls["sentinel"].append(flow)
-            headers["OpenAI-Sentinel-Token"] = "sentinel-token"
-
-        reg.session = FakeSession()
-        reg._add_sentinel_headers = fake_sentinel
-        reg._rebuild_session = lambda: calls.__setitem__("rebuild", calls["rebuild"] + 1)
+        reg._post_auth_json_with_fallback = fake_post
         result = reg.create_account("A", "2000-01-01")
 
         self.assertEqual(result["continue_url"], "https://callback.example")
-        self.assertEqual(calls["sentinel"], ["oauth_create_account"])
-        self.assertEqual(calls["rebuild"], 1)
-        self.assertEqual(calls["post"][0][0], "https://auth.openai.com/api/accounts/create_account")
-        self.assertEqual(calls["post"][0][1]["json"], {"name": "A", "birthdate": "2000-01-01"})
-        self.assertIs(calls["post"][0][1]["allow_redirects"], False)
+        self.assertEqual(calls[0][0], "/api/accounts/create_account")
+        self.assertEqual(calls[0][1], {"name": "A", "birthdate": "2000-01-01"})
+        self.assertEqual(calls[0][2]["flow"], "oauth_create_account")
+        self.assertIs(calls[0][2]["allow_redirects"], False)
 
     def test_create_account_invalid_state_is_non_retryable_auth_error(self):
         self.assertTrue(auto_register._is_auth_session_invalid_error("invalid_state"))
         self.assertTrue(auto_register._is_auth_session_invalid_error("Your sign-in session is no longer valid. Please start over."))
+        self.assertTrue(auto_register._is_auth_session_invalid_error({"error": {"code": "invalid_state"}}))
         self.assertFalse(auto_register._is_auth_session_invalid_error("name is invalid"))
+
+    def test_auth_json_fallback_retries_transport_error_with_http1_rebuild(self):
+        reg = chatgpt_register.ChatGPTRegister(verbose=False)
+        calls = {"post": 0, "rebuild": 0, "sentinel": []}
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = '{"continue_url": "/ok"}'
+
+            def json(self):
+                return {"continue_url": "/ok"}
+
+        class FakeSession:
+            def post(self, _url, **_kwargs):
+                calls["post"] += 1
+                if calls["post"] == 1:
+                    raise ConnectionError("curl: (55)")
+                return FakeResponse()
+
+        def fake_sentinel(headers, flow):
+            calls["sentinel"].append(flow)
+            headers["OpenAI-Sentinel-Token"] = "sentinel-token"
+
+        reg.session = FakeSession()
+        reg._add_sentinel_headers = fake_sentinel
+        reg._rebuild_session = lambda: calls.__setitem__("rebuild", calls["rebuild"] + 1)
+
+        result = reg._post_auth_json_with_fallback(
+            "/api/test",
+            {"x": 1},
+            referer="https://auth.openai.com/test",
+            flow="authorize_continue",
+        )
+
+        self.assertEqual(result["continue_url"], "/ok")
+        self.assertEqual(result["_transport"], "http1-rebuild")
+        self.assertEqual(calls["post"], 2)
+        self.assertEqual(calls["rebuild"], 1)
+        self.assertEqual(calls["sentinel"], ["authorize_continue", "authorize_continue"])
 
     def test_auto_register_cancel_with_eta_starts_background_job(self):
         calls = []

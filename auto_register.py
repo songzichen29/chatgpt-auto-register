@@ -74,6 +74,11 @@ def _retry_call(fn, max_retries=2, delay=2, label=""):
 
 def _is_auth_session_invalid_error(text: str) -> bool:
     """识别服务端明确要求 start over 的 auth 状态错误。"""
+    if isinstance(text, dict):
+        try:
+            text = json.dumps(text, ensure_ascii=False)
+        except Exception:
+            text = str(text)
     low = str(text or "").lower()
     return any(
         marker in low
@@ -392,7 +397,9 @@ def register_one(
         # 创建账户 (用户名+生日) — 最多重试 create_account_max_retries 次
         # ============================================================
         last_create_error = ""
+        create_attempts_done = 0
         for ca_attempt in range(create_account_max_retries):
+            create_attempts_done = ca_attempt + 1
             ca_name = random_name() if ca_attempt > 0 else name
             ca_birthdate = random_birthdate() if ca_attempt > 0 else birthdate
             if verbose:
@@ -405,11 +412,11 @@ def register_one(
                 birthdate = ca_birthdate
                 break
 
-            last_create_error = result.get("_body", "") or f"status={result.get('_status')}"
+            last_create_error = result.get("_body", "") or result.get("_error", "") or f"status={result.get('_status')}"
             if verbose:
                 detail = last_create_error[:200]
                 print(f"  创建账户失败 [{ca_attempt+1}]: {detail}")
-            if _is_auth_session_invalid_error(last_create_error):
+            if _is_auth_session_invalid_error(result) or _is_auth_session_invalid_error(last_create_error):
                 if verbose:
                     print("  创建账户会话已失效，停止本轮创建重试")
                 break
@@ -419,7 +426,7 @@ def register_one(
         if not callback_url:
             if auto_activate:
                 _cancel_with_eta(sms, phone, "创建账户失败", verbose)
-            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"创建账户失败(已重试{create_account_max_retries}次): {last_create_error[:200]}"}
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"创建账户失败(已尝试{create_attempts_done or create_account_max_retries}次): {last_create_error[:200]}"}
 
         token = _retry_call(lambda: reg.oauth_callback(callback_url), sr, label="OAuth回调")
         access_token = _retry_call(lambda: reg.get_access_token(), sr, label="获取Token")
