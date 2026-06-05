@@ -258,6 +258,7 @@ class ChatGPTRegister:
         # curl 55 修复: 重建 session 避免复用失效连接
         self._rebuild_session()
         r = None
+        error = ""
         try:
             r = self.session.post(
                 f"{AUTH}/api/accounts/phone-otp/validate",
@@ -267,10 +268,13 @@ class ChatGPTRegister:
             )
             ct = r.headers.get("content-type", "") if r is not None else ""
             data = r.json() if ct.startswith("application/json") else {}
-        except Exception:
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             data = {}
         data["_status"] = r.status_code if r is not None else 0
         data["_body"] = r.text[:500] if r is not None and r.text else ""
+        if error:
+            data["_error"] = error[:500]
         return data
 
     # ---- Step 8: 创建账户 (用户名+生日) ----
@@ -387,7 +391,9 @@ def register_phone_account(
         result = reg.validate_otp(code)
         continue_url = result.get("continue_url", "")
         if not continue_url:
-            return {"ok": False, "phone": phone, "error": f"验证码校验失败(status={result.get('_status')})"}
+            detail = (result.get("_error") or result.get("_body") or "")[:160]
+            suffix = f": {detail}" if detail else ""
+            return {"ok": False, "phone": phone, "error": f"验证码校验失败(status={result.get('_status')}){suffix}"}
         reg.visit_about_you(continue_url)
         result = reg.create_account(name, birthdate)
         callback_url = result.get("continue_url", "")

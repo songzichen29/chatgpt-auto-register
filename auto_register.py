@@ -244,10 +244,31 @@ def register_one(
                 break  # 校验成功，跳出循环
 
             # 校验失败：请求 SMS 平台重发短信 (status=3)，复用同一号码
-            detail = result.get("_body") or ""
+            detail = result.get("_error") or result.get("_body") or ""
             _last_otp_error = f"验证码校验失败(status={result.get('_status')})"
             if detail:
                 _last_otp_error += f": {detail[:160]}"
+            try:
+                status_code = int(result.get("_status") or 0)
+            except Exception:
+                status_code = 0
+
+            # status=0 表示 validate 请求本身没有拿到 HTTP 响应，多半是连接/TLS/超时等
+            # 传输层异常；这时不能把它当成"验证码错误"去请求短信平台重发，
+            # 否则会浪费已收到的正确验证码，并让平台停在 STATUS_WAIT_RETRY。
+            if status_code == 0:
+                if otp_attempt < otp_max_retries - 1:
+                    if verbose:
+                        print(
+                            f"  {_last_otp_error}，[OTP重试 {otp_attempt + 1}/{otp_max_retries - 1}] "
+                            "未收到验证接口响应，继续使用同一验证码重试校验"
+                        )
+                    _time.sleep(2)
+                    continue
+                if verbose:
+                    print(f"  {_last_otp_error}，已用完重试次数")
+                break
+
             if otp_attempt < otp_max_retries - 1:
                 sms.resend()
                 _retry_call(lambda: reg.send_otp(send_otp_url), sr, label="重新发送验证码")

@@ -56,6 +56,7 @@ NAME = _REGISTER.get("name") or "A"
 BIRTHDATE = _REGISTER.get("birthdate") or "2000-01-01"
 CODE_TIMEOUT = int(_CONFIG.get("code_timeout") or 120)  # 等待验证码超时（秒）
 STEP_RETRIES = 2    # 每步重试次数
+CREATE_ACCOUNT_RETRIES = int(_REGISTER.get("create_account_max_retries") or _CONFIG.get("create_account_max_retries") or 20)
 
 # SUB2API 配置（用于获取 OAuth URL）
 SUB2API_URL = _SUB2API.get("url") or _PHASE2.get("sub2api_url") or "https://api.dwai.cloud"
@@ -63,6 +64,30 @@ SUB2API_EMAIL = _SUB2API.get("email") or _PHASE2.get("sub2api_email") or ""
 SUB2API_PWD = _SUB2API.get("pwd") or _PHASE2.get("sub2api_password") or ""
 MSOUTLOOK_HELPER = _nested(_CONFIG, "msoutlook", "helper_url") or _PHASE2.get("msoutlook_helper_url") or "http://127.0.0.1:17373"
 BATCH_PHASE2_STATUS_FILE = Path("batch_phase2_status.json")
+
+
+def _account_profile_for_attempt(attempt: int) -> tuple[str, str]:
+    """生成 create_account 资料。
+
+    run_phase1_for_phone 之前在缺省配置下会固定提交 name=A / birthdate=2000-01-01。
+    这个组合在 about_you 补资料场景容易被拒；和 auto_register.py 保持一致：
+    - 配置里有明确的非占位姓名/生日时，首轮尊重配置；
+    - 缺省/占位值或后续重试都使用随机资料。
+    """
+    configured_name = str(_REGISTER.get("name") or "").strip()
+    configured_birthdate = str(_REGISTER.get("birthdate") or "").strip()
+    if (
+        attempt == 0
+        and configured_name
+        and configured_birthdate
+        and configured_name != "A"
+        and configured_birthdate != "2000-01-01"
+    ):
+        return configured_name, configured_birthdate
+
+    from auto_register import random_birthdate, random_name
+
+    return random_name(), random_birthdate()
 
 
 def _retry_call(fn, max_retries=STEP_RETRIES, delay=2, label=""):
@@ -314,7 +339,7 @@ def branch_new_account(reg, phone, activation_id):
             "phone": phone,
             "password": PASSWORD,
             "activation_id": activation_id,
-            "error": f"验证码校验失败(status={result.get('_status')})",
+            "error": f"验证码校验失败(status={result.get('_status')}): {(result.get('_error') or result.get('_body') or '')[:160]}",
         }
     print(f"  OTP 验证成功!")
     print(f"  continue_url: {continue_url[:100]}...")
