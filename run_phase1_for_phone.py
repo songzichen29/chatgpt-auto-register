@@ -96,6 +96,71 @@ def hero_sms_set_status(activation_id: str, status: str) -> str:
                 raise RuntimeError(f"setStatus 失败: {e}")
 
 
+def complete_about_you_via_chat_client(phone: str, password: str) -> dict:
+    """用 ChatGPT 原始 OAuth client 补完 about_you。
+
+    实测 Codex OAuth client 在部分半成品手机号账号上会出现：
+      about_you -> create_account: missing_email
+    但同一账号在 ChatGPT client 下可以直接 create_account 成功。
+    这个函数只负责把账号资料补齐，不负责 Codex OAuth 导入。
+    """
+    from openai_bind_email import OAuthSecondHalf
+
+    print("  [修复] 使用 ChatGPT client 补 about_you ...")
+    reg = ChatGPTRegister(proxy=PROXY, verbose=True)
+    reg.visit()
+    csrf = reg.get_csrf()
+    redirect = reg.signin(phone, csrf)
+    if not redirect:
+        return {"ok": False, "error": "ChatGPT client signin 无返回"}
+
+    flow = OAuthSecondHalf(proxy=PROXY, verbose=True)
+    ok, current_url, _html = flow.initiate_oauth(redirect)
+    if not ok:
+        return {"ok": False, "error": f"ChatGPT client OAuth 发起失败: {current_url[:120]}"}
+    flow.sentinel_authorize()
+    r = flow.submit_phone(phone)
+    if r.get("error"):
+        return {"ok": False, "error": f"ChatGPT client submit_phone: {r.get('error')}"}
+    flow.sentinel_password()
+    r = flow.verify_password(password)
+    if r.get("error"):
+        return {"ok": False, "error": f"ChatGPT client verify_password: {r.get('error')}"}
+
+    page_type = (r.get("page") or {}).get("type", "")
+    if "about_you" not in page_type:
+        print(f"  [修复] ChatGPT client 当前 page={page_type or '?'}，无需补 about_you")
+        return {"ok": True, "page": page_type, "skipped": True}
+
+    headers = {
+        **JSON_HEADERS,
+        "referer": f"{AUTH}/about-you",
+        "oai-device-id": flow.device_id,
+    }
+    st = flow._sentinel_token("oauth_create_account")
+    if st:
+        headers["OpenAI-Sentinel-Token"] = st
+    r2 = flow.session.post(
+        f"{AUTH}/api/accounts/create_account",
+        json={"name": NAME, "birthdate": BIRTHDATE},
+        headers=headers,
+        allow_redirects=False,
+    )
+    try:
+        data = r2.json()
+    except Exception:
+        data = {}
+    next_page = (data.get("page") or {}).get("type", "")
+    continue_url = data.get("continue_url", "")
+    print(f"  [修复] create_account status={r2.status_code} page={next_page or '?'}")
+    if r2.ok and continue_url:
+        return {"ok": True, "page": next_page, "continue_url": continue_url}
+    return {
+        "ok": False,
+        "error": f"ChatGPT client create_account 失败: status={r2.status_code} body={r2.text[:300]}",
+    }
+
+
 def update_batch_phase2_status(phone: str, result: dict) -> None:
     """
     run_phase1_for_phone 的已有账号分支会直接完成 Phase 2/OAuth。
@@ -327,9 +392,7 @@ def branch_contact_verification(reg, phone, activation_id):
         print(f"  查询状态失败: {e}")
         code = None
 
-    # 2. 获取 OAuth URL
-    print(f"\n  获取 OAuth URL ...")
-    try:
+    def get_oauth_session():
         r = requests.post(f"{SUB2API_URL}/api/v1/auth/login",
                           json={"email": SUB2API_EMAIL, "password": SUB2API_PWD}, timeout=15)
         login_data = r.json()
@@ -342,6 +405,12 @@ def branch_contact_verification(reg, phone, activation_id):
         oauth_url = oauth_data["data"]["auth_url"]
         session_id = oauth_data["data"]["session_id"]
         oauth_state = parse_qs(urlparse(oauth_url).query).get("state", [""])[0]
+        return oauth_url, session_id, oauth_state
+
+    # 2. 获取 OAuth URL
+    print(f"\n  获取 OAuth URL ...")
+    try:
+        oauth_url, session_id, oauth_state = get_oauth_session()
         print(f"  OAuth URL: {oauth_url[:120]}...")
     except Exception as e:
         return {
@@ -382,27 +451,59 @@ def branch_contact_verification(reg, phone, activation_id):
 
     sms = PhoneSMS("hero-sms", HERO_SMS_API_KEY)
 
-    result = run_second_half(
-        oauth_url=oauth_url,
-        phone=phone,
-        password=PASSWORD,
-        icloud_email=email,
-        icloud_cookies={},
-        sub2api_url=SUB2API_URL,
-        sub2api_email=SUB2API_EMAIL,
-        sub2api_password=SUB2API_PWD,
-        sub2api_proxy_id=0,
-        proxy=PROXY,
-        verbose=True,
-        sub2api_session_id=session_id,
-        sub2api_state=oauth_state,
-        msoutlook_helper_url=ms_helper_url,
-        msoutlook_email=email,
-        sms_obj=sms,
-        phone_aid=activation_id,
-        save_import=True,
-        interactive_input=False,  # 不阻塞等 input
-    )
+    result = {"ok": False, "error": "not started"}
+    fixed_about_you = False
+    for phase2_attempt in range(3):
+        if phase2_attempt > 0:
+            wait_sec = 20 if phase2_attempt == 1 else 60
+            print(f"\n  Phase2 重试 {phase2_attempt + 1}/3，等待 {wait_sec}s 后重新获取 OAuth URL ...")
+            time.sleep(wait_sec)
+            try:
+                oauth_url, session_id, oauth_state = get_oauth_session()
+                print(f"  OAuth URL: {oauth_url[:120]}...")
+            except Exception as e:
+                result = {"ok": False, "error": f"重新获取 OAuth URL 失败: {e}"}
+                continue
+
+        result = run_second_half(
+            oauth_url=oauth_url,
+            phone=phone,
+            password=PASSWORD,
+            icloud_email=email,
+            icloud_cookies={},
+            sub2api_url=SUB2API_URL,
+            sub2api_email=SUB2API_EMAIL,
+            sub2api_password=SUB2API_PWD,
+            sub2api_proxy_id=0,
+            proxy=PROXY,
+            verbose=True,
+            sub2api_session_id=session_id,
+            sub2api_state=oauth_state,
+            msoutlook_helper_url=ms_helper_url,
+            msoutlook_email=email,
+            sms_obj=sms,
+            phone_aid=activation_id,
+            save_import=True,
+            interactive_input=False,  # 不阻塞等 input
+        )
+        if result.get("ok"):
+            break
+
+        err = str(result.get("error", ""))
+        if "codex_about_you_missing_email" in err and not fixed_about_you:
+            fix = complete_about_you_via_chat_client(phone, PASSWORD)
+            if not fix.get("ok"):
+                result = {"ok": False, "error": f"{err}; ChatGPT about_you 修复失败: {fix.get('error')}"}
+                break
+            fixed_about_you = True
+            print("  [修复] about_you 已补完，重新跑 Codex Phase2")
+            continue
+
+        if "rate_limit_exceeded" in err or "Too many requests" in err or "429" in err:
+            print(f"  [WARN] Phase2 限流，可重试: {err[:160]}")
+            continue
+
+        break
 
     if result.get("ok"):
         session_token = result.get("session_token", "")

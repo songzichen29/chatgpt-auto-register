@@ -707,11 +707,17 @@ def run_second_half(
         page_type = (r.get("page") or {}).get("type", "")
         log(f"[5] page: {page_type}")
         print(f"  [DEBUG] page_type={repr(page_type)}, about_you={'about_you' in page_type}, consent={'consent' in page_type}, contact_verification={'contact_verification' in page_type}")
+        code = None
 
-        # 分支判断
-        if "about_you" in page_type:
-            # 新号没填资料 → 先填资料
-            log("[5] about_you 页, 先填资料 ...")
+        def _capture_code(continue_url: str, stage: str) -> Optional[str]:
+            captured = flow.follow_continue_until_code(continue_url) if continue_url else None
+            if not captured:
+                captured = flow.final_oauth(oauth_params)
+            if not captured:
+                log(f"[10] {stage}: 未捕获到 code (url={continue_url[:80] if continue_url else 'empty'})")
+            return captured
+
+        def _submit_about_you_once() -> Dict[str, Any]:
             h = {
                 "accept": "application/json",
                 "accept-language": "en-US,en;q=0.9",
@@ -727,49 +733,139 @@ def run_second_half(
                 "referer": f"{AUTH}/about-you",
                 "oai-device-id": flow.device_id,
             }
-            # 添加 Sentinel token（与 chatgpt_register.py 的 create_account 一致）
             st = flow._sentinel_token("oauth_create_account")
             if st:
                 h["OpenAI-Sentinel-Token"] = st
             log(f"[5] create_account headers: oai-device-id={flow.device_id[:20]}..., sentinel={'yes' if st else 'no'}")
-            r = flow.session.post(
+            resp = flow.session.post(
                 f"{AUTH}/api/accounts/create_account",
                 json={"name": "A", "birthdate": "2000-01-01"},
                 headers=h,
                 allow_redirects=False,
             )
-            log(f"[5] create_account status: {r.status_code}")
-            log(f"[5] create_account body: {r.text[:500] if r.text else 'empty'}")
-            # 健壮解析：按 content-type 判断，避免 302 等非 200 响应解析失败
-            ct = r.headers.get("content-type", "")
+            log(f"[5] create_account status: {resp.status_code}")
+            log(f"[5] create_account body: {resp.text[:500] if resp.text else 'empty'}")
+            ct = resp.headers.get("content-type", "")
             if ct.startswith("application/json"):
                 try:
-                    data = r.json()
+                    data = resp.json()
                 except Exception:
                     data = {}
             else:
                 data = {}
-            data.setdefault("_status", r.status_code)
-            data.setdefault("_body", r.text[:500] if r.text else "")
+            data.setdefault("_status", resp.status_code)
+            data.setdefault("_body", resp.text[:500] if resp.text else "")
             continue_url = data.get("continue_url", "")
-            # 检查重定向
-            location = r.headers.get("Location", "")
+            location = resp.headers.get("Location", "")
             if location:
                 continue_url = location if location.startswith("http") else f"{AUTH}{location}"
-            page_type = (data.get("page") or {}).get("type", "")
-            log(f"[5] create_account page: {page_type}")
+            next_page = (data.get("page") or {}).get("type", "")
+            err = data.get("error") or {}
+            err_code = err.get("code", "") if isinstance(err, dict) else ""
+            log(f"[5] create_account page: {next_page}")
             log(f"[5] continue_url: {continue_url[:100] if continue_url else 'empty'}")
-            # 资料填完后可能到 add_email
-            if "consent" in page_type or "add_email" in page_type or "email_otp" in page_type:
-                pass  # 继续走下面的分支
-            else:
-                code = flow.follow_continue_until_code(continue_url) if continue_url else None
-                if not code:
-                    code = flow.final_oauth(oauth_params)
-                if not code:
-                    return {"ok": False, "error": f"no authorization code after about_you (status={r.status_code}, page={page_type}, url={continue_url[:80] if continue_url else 'empty'})"}
+            return {
+                "ok": not bool(err_code),
+                "status": resp.status_code,
+                "page_type": next_page,
+                "continue_url": continue_url,
+                "error": err,
+                "error_code": err_code,
+            }
 
-        if "consent" in page_type:
+        def _bind_email_and_continue(stage: str) -> Dict[str, Any]:
+            if not icloud_email:
+                return {"ok": False, "error": f"{stage}: missing bind email"}
+            log(f"[6] 绑定邮箱: {icloud_email} ...")
+            history_codes = _get_email_history_codes(
+                msoutlook_helper_url, msoutlook_email, verbose,
+                msoutlook_helper_mode=msoutlook_helper_mode,
+                msoutlook_helper_script=msoutlook_helper_script,
+            )
+            if history_codes:
+                log(f"[7] 邮箱历史码 (将排除): {history_codes}")
+            send_r = flow.send_bind_email(icloud_email)
+            if send_r.get("error"):
+                log(f"[6] 失败: {send_r.get('error')}")
+                return {"ok": False, "error": f"{stage}: send_bind_email: {send_r.get('error')}"}
+            log(f"[6] page: {(send_r.get('page') or {}).get('type', '?')}")
+
+            code_bind = bind_code
+            if not code_bind:
+                code_bind = _poll_bind_code(
+                    icloud_email, icloud_cookies, imap_user, imap_password,
+                    msoutlook_helper_url, msoutlook_email, verbose, timeout=240,
+                    exclude_codes=history_codes or None,
+                    msoutlook_helper_mode=msoutlook_helper_mode,
+                    msoutlook_helper_script=msoutlook_helper_script,
+                )
+                if not code_bind:
+                    print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email or msoutlook_email}")
+                    if interactive_input:
+                        code_bind = input("  [?] 输入6位验证码: ").strip()
+            if not code_bind:
+                return {"ok": False, "error": f"{stage}: binding code timeout"}
+            log(f"[7] 绑定验证码: {code_bind}")
+
+            verify_r = flow.verify_email_otp(code_bind)
+            if verify_r.get("error"):
+                log(f"[8] 失败: {verify_r.get('error')}")
+                return {"ok": False, "error": f"{stage}: verify_email_otp: {verify_r.get('error')}"}
+            next_page = (verify_r.get("page") or {}).get("type", "")
+            continue_url = verify_r.get("continue_url", "")
+            log(f"[8] page: {next_page or '?'}")
+
+            if "about_you" in next_page:
+                return _handle_about_you(f"{stage}_about_you")
+
+            captured = _capture_code(continue_url, stage)
+            if captured:
+                return {"ok": True, "code": captured, "page_type": next_page, "continue_url": continue_url}
+            return {"ok": True, "page_type": next_page, "continue_url": continue_url}
+
+        def _handle_about_you(stage: str) -> Dict[str, Any]:
+            about_r = _submit_about_you_once()
+            next_page = about_r.get("page_type", "")
+            continue_url = about_r.get("continue_url", "")
+            err_code = about_r.get("error_code", "")
+            if err_code == "missing_email":
+                log(f"[5] {stage}: create_account 返回 missing_email，需先用 ChatGPT client 补 about_you 后重跑 Codex OAuth")
+                return {
+                    "ok": False,
+                    "error": f"codex_about_you_missing_email: {stage}",
+                    "retry_after_chat_about_you": True,
+                }
+            if err_code:
+                return {"ok": False, "error": f"{stage}: create_account: {about_r.get('error')}"}
+
+            if "add_email" in next_page or "email_otp" in next_page:
+                return {"ok": True, "page_type": next_page, "continue_url": continue_url}
+
+            captured = _capture_code(continue_url, stage)
+            if captured:
+                return {"ok": True, "code": captured, "page_type": next_page, "continue_url": continue_url}
+            return {
+                "ok": False,
+                "error": f"no authorization code after {stage} (status={about_r.get('status')}, page={next_page}, url={continue_url[:80] if continue_url else 'empty'})",
+            }
+
+        # 分支判断
+        if "about_you" in page_type:
+            # 新号没填资料 → 先填资料
+            log("[5] about_you 页, 先填资料 ...")
+            handled = _handle_about_you("about_you")
+            if not handled.get("ok"):
+                return {"ok": False, "error": handled.get("error", "about_you failed")}
+            if handled.get("code"):
+                code = handled["code"]
+                page_type = "code_captured"
+            else:
+                page_type = handled.get("page_type", "")
+                continue_url = handled.get("continue_url", "")
+
+        if code:
+            pass
+        elif "consent" in page_type:
             # 已到同意页 → 选工作区 → 拿 code
             log("[5] 已到 consent 页，跳过绑邮箱")
             dump = flow.get_session_dump()
@@ -818,7 +914,20 @@ def run_second_half(
             page_type = (r.get("page") or {}).get("type", "")
             log(f"[5.5] 验证后 page: {page_type}")
             # 继续后面的流程
-            if "consent" in page_type:
+            if "about_you" in page_type:
+                log("[5.5] 验证后到 about_you，继续补资料 ...")
+                handled = _handle_about_you("contact_verification_about_you")
+                if not handled.get("ok"):
+                    return {"ok": False, "error": handled.get("error", "about_you after contact_verification failed")}
+                if handled.get("code"):
+                    code = handled["code"]
+                    page_type = "code_captured"
+                else:
+                    page_type = handled.get("page_type", "")
+                    continue_url = handled.get("continue_url", "")
+            if code:
+                pass
+            elif "consent" in page_type:
                 log("[5.5] 已到 consent 页，跳过绑邮箱")
                 dump = flow.get_session_dump()
                 workspaces = ((dump.get("client_auth_session") or {}).get("workspaces") or [])
@@ -859,7 +968,20 @@ def run_second_half(
             page_type = (r.get("page") or {}).get("type", "")
             log(f"[5.5] 验证后 page: {page_type}")
             # 继续后面的流程
-            if "consent" in page_type:
+            if "about_you" in page_type:
+                log("[5.5] 验证后到 about_you，继续补资料 ...")
+                handled = _handle_about_you("contact_verification_about_you")
+                if not handled.get("ok"):
+                    return {"ok": False, "error": handled.get("error", "about_you after contact_verification failed")}
+                if handled.get("code"):
+                    code = handled["code"]
+                    page_type = "code_captured"
+                else:
+                    page_type = handled.get("page_type", "")
+                    continue_url = handled.get("continue_url", "")
+            if code:
+                pass
+            elif "consent" in page_type:
                 log("[5.5] 已到 consent 页，跳过绑邮箱")
                 dump = flow.get_session_dump()
                 workspaces = ((dump.get("client_auth_session") or {}).get("workspaces") or [])
@@ -875,6 +997,9 @@ def run_second_half(
                     code = flow.final_oauth(oauth_params)
                 if not code:
                     return {"ok": False, "error": "no authorization code after contact_verification"}
+
+        elif code:
+            pass
 
         elif "email_otp_verification" in page_type:
             # email_otp_verification 说明上次 Phase 2 部分完成，
