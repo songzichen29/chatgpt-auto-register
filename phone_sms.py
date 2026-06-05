@@ -442,6 +442,27 @@ class PhoneSMS:
         """SmsBower 兼容别名：轮询等待验证码"""
         return self.wait_for_code(timeout=timeout, exclude_codes=exclude_codes)
 
+    def _cancel_min_hold(self, min_hold: Optional[float] = None) -> float:
+        if min_hold is not None:
+            return float(min_hold)
+        if self.provider in {"hero-sms", "smsbower"}:
+            return self.CANCEL_MIN_HOLD
+        return 0.0
+
+    def cancel_wait_seconds(self, min_hold: Optional[float] = None) -> float:
+        """返回按平台规则还需要等多久才能取消。
+
+        若当前 PhoneSMS 实例不是拿号实例（例如 worker_pool 失败后重新构造
+        一个实例只拿到 activation_id），本地没有 getNumber 时间，此时返回 0：
+        调用方应该先尝试取消，若平台拒绝再轮询重试。
+        """
+        hold = self._cancel_min_hold(min_hold)
+        if hold <= 0:
+            return 0.0
+        if self._activated_at is None:
+            return 0.0
+        return max(0.0, hold - (time.time() - self._activated_at))
+
     def cancel(self, activation_id: str = None, min_hold: Optional[float] = None) -> float:
         """请求取消激活。考虑 hero-sms / SmsBower 协议的 150s 冷却期。
 
@@ -458,20 +479,50 @@ class PhoneSMS:
         aid = activation_id or self._activation_id
         if not aid:
             return 0.0
-        if min_hold is None:
-            min_hold = self.CANCEL_MIN_HOLD
         now = time.time()
-        if self._activated_at is not None:
-            elapsed = now - self._activated_at
-        else:
-            elapsed = min_hold  # 没记录拿号时间，直接放行
-        wait_sec = max(0.0, min_hold - elapsed)
+        wait_sec = self.cancel_wait_seconds(min_hold)
         fire_at = now + wait_sec
         with self._pending_lock:
             # 避免重复入队
             if not any(item[0] == aid for item in self._pending_cancels):
                 self._pending_cancels.append((aid, fire_at, 0))
         return wait_sec
+
+    def cancel_blocking(
+        self,
+        activation_id: str = None,
+        min_hold: Optional[float] = None,
+        poll_interval: float = 10.0,
+        max_wait: Optional[float] = None,
+    ) -> bool:
+        """同步取消号码，直到平台确认或超时。
+
+        这个方法用于 worker_pool 这类短生命周期子进程。之前只把取消请求
+        放进进程内 daemon 队列，进程退出后队列线程会被杀掉，导致平台号码
+        状态没有真正改成取消。同步等待可以保证返回 True 时已经调用成功。
+        """
+        aid = activation_id or self._activation_id
+        if not aid:
+            return False
+        wait_sec = self.cancel_wait_seconds(min_hold)
+        if max_wait is None:
+            max_wait = max(60.0, wait_sec + self._cancel_min_hold(min_hold) + 60.0)
+        deadline = time.time() + max(0.0, float(max_wait))
+
+        if wait_sec > 0:
+            time.sleep(min(wait_sec, max(0.0, deadline - time.time())))
+
+        while True:
+            try:
+                if bool(self.client.cancel(aid)):
+                    return True
+            except Exception:
+                pass
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            time.sleep(min(max(1.0, float(poll_interval)), remaining))
 
     def _cancel_worker(self):
         """后台守护线程：扫描延迟队列，到点发送 cancel。

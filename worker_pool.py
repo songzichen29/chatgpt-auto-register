@@ -637,7 +637,7 @@ def _sms_action(cfg: dict, activation_id: str, action: str) -> bool:
     if action == "complete":
         sms.complete(activation_id)
     elif action == "cancel":
-        sms.cancel(activation_id)
+        return bool(sms.cancel_blocking(activation_id))
     else:
         raise ValueError(f"unknown sms action: {action}")
     return True
@@ -731,9 +731,11 @@ def worker(
             log(f"Phase 1 失败: {result.get('phone', '?')} {phase1_error}", "error")
             if activation_id:
                 try:
-                    _sms_action(cfg, activation_id, "cancel")
-                    state.record_cancelled()
-                    log(f"号码已取消: {result.get('phone', '?')}", "warn")
+                    if _sms_action(cfg, activation_id, "cancel"):
+                        state.record_cancelled()
+                        log(f"号码已取消: {result.get('phone', '?')}", "warn")
+                    else:
+                        log(f"号码取消未确认: {result.get('phone', '?')}", "error")
                 except Exception as exc:
                     log(f"号码取消失败: {exc}", "error")
             result_writer.append_account(_account_record("fail_phase1", result, lease.email))
@@ -748,9 +750,11 @@ def worker(
         if global_stop.is_set():
             result_writer.append_account(_account_record("interrupted_after_phase1", result, lease.email))
             try:
-                _sms_action(cfg, activation_id, "cancel")
-                state.record_cancelled()
-                log(f"中断收尾，号码已取消: {result.get('phone', '?')}", "warn")
+                if _sms_action(cfg, activation_id, "cancel"):
+                    state.record_cancelled()
+                    log(f"中断收尾，号码已取消: {result.get('phone', '?')}", "warn")
+                else:
+                    log(f"中断收尾，号码取消未确认: {result.get('phone', '?')}", "error")
             except Exception as exc:
                 log(f"中断收尾取消号码失败: {exc}", "error")
             lease.release(cooldown)
@@ -813,9 +817,11 @@ def worker(
             if active_lease and not active_lease.finalized:
                 active_lease.release(cooldown)
             try:
-                _sms_action(cfg, activation_id, "cancel")
-                state.record_cancelled()
-                log(f"Phase 2 失败，号码已取消: {result.get('phone', '?')}", "warn")
+                if _sms_action(cfg, activation_id, "cancel"):
+                    state.record_cancelled()
+                    log(f"Phase 2 失败，号码已取消: {result.get('phone', '?')}", "warn")
+                else:
+                    log(f"Phase 2 失败，号码取消未确认: {result.get('phone', '?')}", "error")
             except Exception as exc:
                 log(f"Phase 2 失败，号码取消失败: {exc}", "error")
             result_writer.append_account(_account_record("fail_phase2", result, final_email, outcome.error))

@@ -72,18 +72,26 @@ def _retry_call(fn, max_retries=2, delay=2, label=""):
             _time.sleep(delay)
 
 def _cancel_with_eta(sms, phone: str, reason: str, verbose: bool = True):
-    """触发延迟取消并打印资金安全提示。
+    """同步取消号码并打印资金安全提示。
 
     hero-sms / SmsBower 协议要求拿号后 ≥150s 才能 setStatus=8，
-    PhoneSMS.cancel 内部会把请求放入延迟队列，到点后由后台线程退款。
-    这里把"预计还需多少秒退款"打出来，让资金去向可见。
+    这里必须等待平台真正确认取消；否则短生命周期 worker 进程退出后，
+    进程内取消队列会丢失，平台号码状态不会被修改。
     """
     try:
-        wait_sec = float(sms.cancel())
-    except Exception:
+        wait_sec = float(sms.cancel_wait_seconds())
+        if verbose and wait_sec > 0:
+            print(f"  [sms] {phone} 将等待约 {wait_sec:.0f}s 后取消（{reason}）")
+        ok = bool(sms.cancel_blocking())
+    except Exception as exc:
+        if verbose:
+            print(f"  [sms] {phone} 取消异常（{reason}）: {exc}")
         return
     if verbose:
-        print(f"  [sms] {phone} 已加入取消队列，约 {wait_sec:.0f}s 后退款（{reason}）")
+        if ok:
+            print(f"  [sms] {phone} 已取消（{reason}）")
+        else:
+            print(f"  [sms] {phone} 取消未确认，可能需平台自然过期退款（{reason}）")
 
 # ============================================================
 # 配置
@@ -207,14 +215,16 @@ def register_one(
         csrf = _retry_call(lambda: reg.get_csrf(), sr, label="CSRF")
         redirect = _retry_call(lambda: reg.signin(phone, csrf), sr, label="发起登录")
         if not redirect:
-            _cancel_with_eta(sms, phone, "signin 无返回", verbose)
+            if auto_activate:
+                _cancel_with_eta(sms, phone, "signin 无返回", verbose)
             return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": "signin 无返回(可能被 Cloudflare 拦截)"}
         _retry_call(lambda: reg.jump_to_auth(redirect), sr, label="OAuth跳转")
         result = _retry_call(lambda: reg.register_user(phone, password), sr, label="注册")
 
         continue_url = result.get("continue_url", "")
         if not continue_url:
-            _cancel_with_eta(sms, phone, "注册被拒", verbose)
+            if auto_activate:
+                _cancel_with_eta(sms, phone, "注册被拒", verbose)
             return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"注册被拒(status={result.get('_status')})"}
 
         # ---- OTP 验证 ----
@@ -228,7 +238,8 @@ def register_one(
         code = sms.wait_code(timeout=config["code_timeout"])
         if not code:
             # 验证码超时：号码收不到验证码，重发也没用，加入延迟取消队列（≥150s 后 setStatus=8 退款）
-            _cancel_with_eta(sms, phone, "验证码超时", verbose)
+            if auto_activate:
+                _cancel_with_eta(sms, phone, "验证码超时", verbose)
             return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": "验证码超时"}
 
         if verbose:
@@ -286,7 +297,8 @@ def register_one(
                     print(f"  {_last_otp_error}，已用完重试次数")
 
         if not continue_url:
-            _cancel_with_eta(sms, phone, "OTP 失败", verbose)
+            if auto_activate:
+                _cancel_with_eta(sms, phone, "OTP 失败", verbose)
             return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"{_last_otp_error}(已重试{otp_max_retries}次)"}
 
         # ============================================================
@@ -319,7 +331,8 @@ def register_one(
                 _time.sleep(1)
 
         if not callback_url:
-            _cancel_with_eta(sms, phone, "创建账户失败", verbose)
+            if auto_activate:
+                _cancel_with_eta(sms, phone, "创建账户失败", verbose)
             return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"创建账户失败(已重试{create_account_max_retries}次): {last_create_error[:200]}"}
 
         token = _retry_call(lambda: reg.oauth_callback(callback_url), sr, label="OAuth回调")
@@ -342,8 +355,9 @@ def register_one(
         }
 
     except Exception as e:
-        try: sms.cancel()
-        except Exception: pass
+        if auto_activate:
+            try: sms.cancel_blocking()
+            except Exception: pass
         return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": str(e)}
 
 # ============================================================

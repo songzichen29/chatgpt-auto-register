@@ -90,6 +90,73 @@ def _account_profile_for_attempt(attempt: int) -> tuple[str, str]:
     return random_name(), random_birthdate()
 
 
+def _is_retryable_auth_error(value) -> bool:
+    text = str(value or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "rate_limit_exceeded",
+            "too many requests",
+            " 429",
+            "status=429",
+            "proxyerror",
+            "remote end closed connection",
+            "ssleoferror",
+            "unexpected_eof",
+            "connection reset",
+            "max retries exceeded",
+            "read timed out",
+            "connect timeout",
+            "temporarily unavailable",
+        )
+    )
+
+
+def _retry_wait_seconds(error_text: str, attempt: int) -> int:
+    text = str(error_text or "").lower()
+    if "rate_limit_exceeded" in text or "too many requests" in text or "429" in text:
+        return 60 * (attempt + 1)
+    return 10 * (attempt + 1)
+
+
+def _is_phone_account_auth_failure(value) -> bool:
+    """判断失败是否属于手机号/账号状态，不应消耗当前待绑定邮箱。"""
+    text = str(value or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "codex_about_you_missing_email",
+            "registration_disallowed",
+            "invalid_username_or_password",
+            "submit_phone",
+            "verify_password",
+            "contact_verification code timeout",
+            "validate_contact_otp",
+            "phone-otp",
+        )
+    )
+
+
+def _should_mark_email_error(value) -> bool:
+    """只有明确走到邮箱绑定/验码阶段的失败，才把邮箱从池子里剔除。"""
+    text = str(value or "").lower()
+    if _is_retryable_auth_error(text) or _is_phone_account_auth_failure(text):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "email_already_in_use",
+            "send_bind_email",
+            "binding code timeout",
+            "verify_email_otp",
+            "email_otp",
+            "email-otp",
+            "add_email",
+            "add-email",
+        )
+    )
+
+
 def _retry_call(fn, max_retries=STEP_RETRIES, delay=2, label=""):
     """重试包装器"""
     for attempt in range(max_retries + 1):
@@ -157,32 +224,53 @@ def complete_about_you_via_chat_client(phone: str, password: str) -> dict:
         print(f"  [修复] ChatGPT client 当前 page={page_type or '?'}，无需补 about_you")
         return {"ok": True, "page": page_type, "skipped": True}
 
-    headers = {
-        **JSON_HEADERS,
-        "referer": f"{AUTH}/about-you",
-        "oai-device-id": flow.device_id,
-    }
-    st = flow._sentinel_token("oauth_create_account")
-    if st:
-        headers["OpenAI-Sentinel-Token"] = st
-    r2 = flow.session.post(
-        f"{AUTH}/api/accounts/create_account",
-        json={"name": NAME, "birthdate": BIRTHDATE},
-        headers=headers,
-        allow_redirects=False,
-    )
-    try:
-        data = r2.json()
-    except Exception:
-        data = {}
-    next_page = (data.get("page") or {}).get("type", "")
-    continue_url = data.get("continue_url", "")
-    print(f"  [修复] create_account status={r2.status_code} page={next_page or '?'}")
-    if r2.ok and continue_url:
-        return {"ok": True, "page": next_page, "continue_url": continue_url}
+    last_error = ""
+    for ca_attempt in range(CREATE_ACCOUNT_RETRIES):
+        ca_name, ca_birthdate = _account_profile_for_attempt(ca_attempt)
+        print(
+            f"  [修复] create_account [{ca_attempt + 1}/{CREATE_ACCOUNT_RETRIES}]: "
+            f"name={ca_name} birthdate={ca_birthdate}"
+        )
+        headers = {
+            **JSON_HEADERS,
+            "referer": f"{AUTH}/about-you",
+            "oai-device-id": flow.device_id,
+        }
+        st = flow._sentinel_token("oauth_create_account")
+        if st:
+            headers["OpenAI-Sentinel-Token"] = st
+        r2 = flow.session.post(
+            f"{AUTH}/api/accounts/create_account",
+            json={"name": ca_name, "birthdate": ca_birthdate},
+            headers=headers,
+            allow_redirects=False,
+        )
+        try:
+            data = r2.json()
+        except Exception:
+            data = {}
+        next_page = (data.get("page") or {}).get("type", "")
+        continue_url = data.get("continue_url", "")
+        err = data.get("error") or {}
+        err_code = err.get("code", "") if isinstance(err, dict) else ""
+        last_error = r2.text[:300] if r2.text else f"status={r2.status_code}, page={next_page or '?'}"
+        print(f"  [修复] create_account status={r2.status_code} page={next_page or '?'} code={err_code or '-'}")
+        if r2.ok and continue_url:
+            return {
+                "ok": True,
+                "page": next_page,
+                "continue_url": continue_url,
+                "name": ca_name,
+                "birthdate": ca_birthdate,
+            }
+        if ca_attempt < CREATE_ACCOUNT_RETRIES - 1:
+            if err_code in {"rate_limit_exceeded"} or r2.status_code == 429:
+                time.sleep(20)
+            else:
+                time.sleep(1)
     return {
         "ok": False,
-        "error": f"ChatGPT client create_account 失败: status={r2.status_code} body={r2.text[:300]}",
+        "error": f"ChatGPT client create_account 失败(已重试{CREATE_ACCOUNT_RETRIES}次): {last_error}",
     }
 
 
@@ -350,16 +438,29 @@ def branch_new_account(reg, phone, activation_id):
 
     # Step 9: 创建账户
     print(f"\n--- Step 9: 创建账户 ---")
-    result = _retry_call(lambda: reg.create_account(NAME, BIRTHDATE), label="创建账户")
-    callback_url = result.get("continue_url", "")
+    callback_url = ""
+    last_create_error = ""
+    for ca_attempt in range(CREATE_ACCOUNT_RETRIES):
+        ca_name, ca_birthdate = _account_profile_for_attempt(ca_attempt)
+        print(
+            f"  创建账户 [{ca_attempt + 1}/{CREATE_ACCOUNT_RETRIES}]: "
+            f"name={ca_name} birthdate={ca_birthdate}"
+        )
+        result = _retry_call(lambda n=ca_name, b=ca_birthdate: reg.create_account(n, b), label="创建账户")
+        callback_url = result.get("continue_url", "")
+        if callback_url:
+            break
+        last_create_error = result.get("_body", "") or f"status={result.get('_status')}"
+        print(f"  创建账户失败 [{ca_attempt + 1}]: {last_create_error[:200]}")
+        if ca_attempt < CREATE_ACCOUNT_RETRIES - 1:
+            time.sleep(1)
     if not callback_url:
-        detail = result.get("_body", "")[:200]
         return {
             "ok": False,
             "phone": phone,
             "password": PASSWORD,
             "activation_id": activation_id,
-            "error": f"创建账户失败: {detail}",
+            "error": f"创建账户失败(已重试{CREATE_ACCOUNT_RETRIES}次): {last_create_error[:200]}",
         }
     print(f"  创建账户成功!")
     print(f"  callback_url: {callback_url[:100]}...")
@@ -478,9 +579,11 @@ def branch_contact_verification(reg, phone, activation_id):
 
     result = {"ok": False, "error": "not started"}
     fixed_about_you = False
+    next_phase2_wait = 0
     for phase2_attempt in range(3):
         if phase2_attempt > 0:
-            wait_sec = 20 if phase2_attempt == 1 else 60
+            wait_sec = next_phase2_wait or (20 if phase2_attempt == 1 else 60)
+            next_phase2_wait = 0
             print(f"\n  Phase2 重试 {phase2_attempt + 1}/3，等待 {wait_sec}s 后重新获取 OAuth URL ...")
             time.sleep(wait_sec)
             try:
@@ -519,13 +622,18 @@ def branch_contact_verification(reg, phone, activation_id):
             fix = complete_about_you_via_chat_client(phone, PASSWORD)
             if not fix.get("ok"):
                 result = {"ok": False, "error": f"{err}; ChatGPT about_you 修复失败: {fix.get('error')}"}
+                if _is_retryable_auth_error(fix.get("error")) and phase2_attempt < 2:
+                    next_phase2_wait = _retry_wait_seconds(fix.get("error"), phase2_attempt)
+                    print(f"  [WARN] ChatGPT about_you 修复遇到可重试错误，准备重试: {fix.get('error')}")
+                    continue
                 break
             fixed_about_you = True
             print("  [修复] about_you 已补完，重新跑 Codex Phase2")
             continue
 
-        if "rate_limit_exceeded" in err or "Too many requests" in err or "429" in err:
+        if _is_retryable_auth_error(err):
             print(f"  [WARN] Phase2 限流，可重试: {err[:160]}")
+            next_phase2_wait = _retry_wait_seconds(err, phase2_attempt)
             continue
 
         break
@@ -549,7 +657,10 @@ def branch_contact_verification(reg, phone, activation_id):
         }
     else:
         if ms_pool and email:
-            ms_pool.mark_error(email, result.get("error", "run_second_half failed"), phone=phone, password=PASSWORD)
+            if _should_mark_email_error(result.get("error")):
+                ms_pool.mark_error(email, result.get("error", "run_second_half failed"), phone=phone, password=PASSWORD)
+            else:
+                print("  [WARN] 本次失败不属于邮箱本身错误，不把邮箱标记为异常")
         return {
             "ok": False,
             "phone": phone,
