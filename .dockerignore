@@ -1,4 +1,4 @@
-﻿.git
+.git
 .github
 __pycache__/
 *.pyc
@@ -13,9 +13,9 @@ config.json
 icloud_cookies.json
 email_blacklist.json
 msoutlook_used.json
-号.json
-号.json.backup
-删除的账号.json
+?.json
+?.json.backup
+?????.json
 _unused_token_check.json
 batch_phase2_status.json
 results/

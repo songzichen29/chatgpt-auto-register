@@ -1,4 +1,4 @@
-﻿services:
+services:
   chatgpt-auto-register:
     image: ${IMAGE:-ghcr.io/songzichen29/chatgpt-auto-register:worker-control-dashboard}
     container_name: chatgpt-auto-register
@@ -10,7 +10,7 @@
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./config.json:/app/config.json
-      - ./号.json:/app/号.json
+      - ./?.json:/app/?.json
       - ./msoutlook_used.json:/app/msoutlook_used.json
       - ./email_blacklist.json:/app/email_blacklist.json
       - ./icloud_cookies.json:/app/icloud_cookies.json

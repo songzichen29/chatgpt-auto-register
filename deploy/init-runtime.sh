@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 mkdir -p results imports logs
@@ -8,10 +8,14 @@ if [ ! -f config.json ]; then
   echo "created config.json from config.example.json; edit it before running real tasks"
 fi
 
-[ -f "号.json" ] || printf '[]\n' > "号.json"
-[ -f msoutlook_used.json ] || printf '{"records":{}}\n' > msoutlook_used.json
-[ -f email_blacklist.json ] || printf '[]\n' > email_blacklist.json
-[ -f icloud_cookies.json ] || printf '{}\n' > icloud_cookies.json
+[ -f "?.json" ] || printf '[]
+' > "?.json"
+[ -f msoutlook_used.json ] || printf '{"records":{}}
+' > msoutlook_used.json
+[ -f email_blacklist.json ] || printf '[]
+' > email_blacklist.json
+[ -f icloud_cookies.json ] || printf '{}
+' > icloud_cookies.json
 
 if [ ! -f .env ]; then
   cat > .env <<'ENV'
