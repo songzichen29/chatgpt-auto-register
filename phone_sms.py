@@ -61,18 +61,18 @@ class HeroSMS:
         self.api_key = api_key
         self.base_url = base_url
 
-    def _call(self, params: Dict[str, str]) -> str:
+    def _call(self, params: Dict[str, str], timeout: float = 30.0, retries: int = 3) -> str:
         params["api_key"] = self.api_key
         # 网络异常自动重试，避免 SSL/Connection 错误导致整个流程失败
         last_err = None
-        for attempt in range(3):
+        for attempt in range(max(1, int(retries))):
             try:
-                resp = requests.get(self.base_url, params=params, timeout=30)
+                resp = requests.get(self.base_url, params=params, timeout=max(1.0, float(timeout)))
                 return resp.text.strip()
             except requests.exceptions.RequestException as e:
                 last_err = e
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))
+                if attempt < max(1, int(retries)) - 1:
+                    time.sleep(min(2 * (attempt + 1), max(0.0, float(timeout))))
         raise last_err
 
     def get_balance(self) -> float:
@@ -141,7 +141,7 @@ class HeroSMS:
             )
         raise RuntimeError(f"获取号码失败: {result}")
 
-    def get_status(self, activation_id: str) -> str:
+    def get_status(self, activation_id: str, timeout: float = 30.0, retries: int = 3) -> str:
         """
         查询激活状态
         返回: STATUS_WAIT_CODE | STATUS_OK:code | STATUS_CANCEL | STATUS_WAIT_RESEND
@@ -149,7 +149,7 @@ class HeroSMS:
         result = self._call({
             "action": "getStatus",
             "id": activation_id,
-        })
+        }, timeout=timeout, retries=retries)
         return result
 
     def wait_for_code(
@@ -163,10 +163,18 @@ class HeroSMS:
         """轮询等待验证码，超时返回 None"""
         excluded = {str(code).strip() for code in (exclude_codes or []) if str(code).strip()}
         start = time.time()
+        deadline = start + max(0.0, float(timeout))
         _net_errors = 0  # 连续网络错误计数
-        while time.time() - start < timeout:
+        while time.time() < deadline:
             try:
-                status = self.get_status(activation_id)
+                remaining = max(0.0, deadline - time.time())
+                if remaining <= 0:
+                    break
+                status = self.get_status(
+                    activation_id,
+                    timeout=min(8.0, remaining),
+                    retries=1,
+                )
                 _net_errors = 0  # 成功后重置计数
             except requests.exceptions.RequestException as e:
                 _net_errors += 1
@@ -177,7 +185,9 @@ class HeroSMS:
                     if verbose:
                         print(f"  [hero-sms] 连续 {_net_errors} 次网络异常，放弃轮询")
                     return None
-                time.sleep(interval)
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    time.sleep(min(interval, remaining))
                 continue
 
             if verbose:
@@ -188,16 +198,22 @@ class HeroSMS:
                 if code in excluded:
                     if verbose:
                         print(f"  [hero-sms] 忽略旧验证码: {code}")
-                    time.sleep(interval)
+                    remaining = deadline - time.time()
+                    if remaining > 0:
+                        time.sleep(min(interval, remaining))
                     continue
                 return code
             elif status == "STATUS_CANCEL":
                 return None
             elif status == "STATUS_WAIT_RESEND":
                 # 等待重发
-                time.sleep(interval)
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    time.sleep(min(interval, remaining))
             else:
-                time.sleep(interval)
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    time.sleep(min(interval, remaining))
 
         # 不再主动 cancel。hero-sms / SmsBower 协议要求拿号后 ≥150s 才能
         # setStatus=8，否则平台拒绝且不退款。由上层 PhoneSMS 统一走延迟队列。

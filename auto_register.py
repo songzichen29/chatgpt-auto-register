@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import string
+import subprocess
 import sys
 import time as _time
 from datetime import datetime
@@ -72,26 +73,49 @@ def _retry_call(fn, max_retries=2, delay=2, label=""):
             _time.sleep(delay)
 
 def _cancel_with_eta(sms, phone: str, reason: str, verbose: bool = True):
-    """同步取消号码并打印资金安全提示。
+    """后台取消号码并打印资金安全提示。
 
-    hero-sms / SmsBower 协议要求拿号后 ≥150s 才能 setStatus=8，
-    这里必须等待平台真正确认取消；否则短生命周期 worker 进程退出后，
-    进程内取消队列会丢失，平台号码状态不会被修改。
+    hero-sms / SmsBower 协议要求拿号后 ≥150s 才能 setStatus=8。这里不再
+    阻塞当前注册流程，而是启动独立 helper 进程继续等待并取消。
     """
+    aid = getattr(sms, "_activation_id", "") or ""
+    if not aid:
+        if verbose:
+            print(f"  [sms] {phone} 无激活ID，无法取消（{reason}）")
+        return
     try:
         wait_sec = float(sms.cancel_wait_seconds())
         if verbose and wait_sec > 0:
-            print(f"  [sms] {phone} 将等待约 {wait_sec:.0f}s 后取消（{reason}）")
-        ok = bool(sms.cancel_blocking())
+            print(f"  [sms] {phone} 将由后台任务等待约 {wait_sec:.0f}s 后取消（{reason}）")
+        config_path = str(sms.__dict__.get("_config_path") or Path(__file__).parent / "config.json")
+        cmd = [
+            sys.executable,
+            str(Path(__file__).parent / "sms_cancel_once.py"),
+            "--activation-id",
+            str(aid),
+            "--config",
+            config_path,
+            "--phone",
+            str(phone or ""),
+            "--reason",
+            str(reason or ""),
+        ]
+        subprocess.Popen(
+            cmd,
+            cwd=str(Path(__file__).parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=(os.name != "nt"),
+            start_new_session=(os.name != "nt"),
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
+        )
     except Exception as exc:
         if verbose:
-            print(f"  [sms] {phone} 取消异常（{reason}）: {exc}")
+            print(f"  [sms] {phone} 后台取消任务启动异常（{reason}）: {exc}")
         return
     if verbose:
-        if ok:
-            print(f"  [sms] {phone} 已取消（{reason}）")
-        else:
-            print(f"  [sms] {phone} 取消未确认，可能需平台自然过期退款（{reason}）")
+        print(f"  [sms] {phone} 取消任务已后台启动（{reason}）")
 
 # ============================================================
 # 配置
@@ -130,6 +154,7 @@ def load_config(path: str = None) -> dict:
                 if k not in {"sms_provider", "smsbower", "hero_sms", "fivesim",
                              "register", "proxy", "country", "service", "code_timeout"}:
                     config[k] = v
+            config["_config_path"] = str(Path(p).resolve())
             break
     if os.environ.get("SMSBOWER_KEY"):
         config["smsbower"]["api_key"] = os.environ["SMSBOWER_KEY"]
@@ -195,11 +220,13 @@ def register_one(
 
     # 根据配置的 provider 创建 PhoneSMS
     sms = PhoneSMS(sms_provider, _get_sms_api_key(config, sms_provider))
+    sms._config_path = str(config.get("_config_path") or Path(__file__).parent / "config.json")
 
     try:
         if existing_phone:
             # 复用已有手机号（Phase 2 邮箱碰撞重跑 Phase 1）
             aid = existing_phone["activation_id"]
+            sms._activation_id = aid
             phone = existing_phone["phone"]
             if verbose:
                 print(f"  复用手机号: {phone}  激活ID: {aid}  [平台:{sms_provider}]")
@@ -396,7 +423,7 @@ def register_one(
 
     except Exception as e:
         if auto_activate:
-            try: sms.cancel_blocking()
+            try: _cancel_with_eta(sms, phone, "异常收尾", verbose)
             except Exception: pass
         return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": str(e)}
 

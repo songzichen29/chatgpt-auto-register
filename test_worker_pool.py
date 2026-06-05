@@ -1,17 +1,60 @@
 import inspect
 import json
 import requests
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
 import openai_bind_email
 import auto_register
+import phone_sms
 import worker_pool
 
 
 class WorkerPoolComponentTests(unittest.TestCase):
+    def test_auto_register_cancel_with_eta_starts_background_job(self):
+        calls = []
+
+        class FakeSMS:
+            _activation_id = "aid"
+            _config_path = "config.json"
+
+            def cancel_wait_seconds(self):
+                return 123
+
+            def cancel_blocking(self):
+                raise AssertionError("cancel_blocking should not run inline")
+
+        old_popen = subprocess.Popen
+        subprocess.Popen = lambda cmd, **kwargs: calls.append((cmd, kwargs)) or object()
+        try:
+            auto_register._cancel_with_eta(FakeSMS(), "+100", "测试", verbose=False)
+        finally:
+            subprocess.Popen = old_popen
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("sms_cancel_once.py", " ".join(calls[0][0]))
+        self.assertIn("--activation-id", calls[0][0])
+        self.assertIn("aid", calls[0][0])
+
+    def test_hero_sms_wait_for_code_respects_timeout_on_network_timeout(self):
+        client = phone_sms.HeroSMS("key")
+
+        def slow_status(_aid, timeout=30, retries=3):
+            time.sleep(float(timeout) + 0.05)
+            raise requests.exceptions.Timeout("simulated")
+
+        client.get_status = slow_status
+        started = time.time()
+        code = client.wait_for_code("aid", timeout=1, interval=1, verbose=False)
+        elapsed = time.time() - started
+
+        self.assertIsNone(code)
+        self.assertLess(elapsed, 1.5)
+
     def test_load_config_merges_register_password(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "config.json"
