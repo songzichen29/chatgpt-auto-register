@@ -214,8 +214,12 @@ class ChatGPTRegister:
             timeout=30,
         )
 
-    def _rebuild_session(self):
-        """重建 session，迁移 Cookie 和配置，解决 curl 55 错误"""
+    def _rebuild_session(self, force_requests: bool = False):
+        """重建 session，迁移 Cookie 和配置，解决 curl 55 错误。
+
+        force_requests=True 时改用标准 requests（完全不同的 TLS 栈），
+        用于 curl_cffi 的 TLS 指纹被 OpenAI 阻断时的 fallback。
+        """
         # 保存旧 Cookie（含域、路径、安全属性）
         old_cookies = []
         try:
@@ -231,11 +235,14 @@ class ChatGPTRegister:
             self.session.close()
         except Exception:
             pass
-        if self.proxy:
+        if self.proxy or force_requests:
+            # 走代理或 curl_cffi fallback 时统一用标准 requests
             self.session = __import__("requests").Session()
-            self.session.proxies = {"http": self.proxy, "https": self.proxy}
+            if self.proxy:
+                self.session.proxies = {"http": self.proxy, "https": self.proxy}
             self.session.verify = False
         else:
+            # 直连首选用 curl_cffi 保持 TLS 指纹
             self.session = curl_requests.Session(impersonate="chrome", verify=False)
         # 迁移 Cookie，保留域和路径信息
         for name, value, domain, path, secure, expires in old_cookies:
@@ -258,15 +265,16 @@ class ChatGPTRegister:
         sentinel: bool = True,
         rebuild_on_transport: bool = True,
     ) -> dict:
-        """向 auth.openai.com 发送 JSON POST，并对 curl 55 做 HTTP/1.1 短连接兜底。
+        """向 auth.openai.com 发送 JSON POST，并对 curl 55 做 fallback。
 
-        关键点：必须先 rebuild session，再生成 Sentinel header。旧实现先生成
-        Sentinel、再 rebuild session，会让 token 来自旧连接上下文；在 OTP validate
-        这种敏感接口上更容易触发 curl_cffi 的 curl: (55) send failure。
+        第一枪：当前会话（curl_cffi impersonate="chrome"）。
+        第二枪（直连时）：_rebuild_session(force_requests=True) 改用标准 requests，
+                        完全不同的 TLS 栈，绕过 curl_cffi 指纹阻断。
         """
         # 第一枪必须使用当前会话：OTP send 和 validate 之间的授权步骤
-        # 对 auth.openai.com 的当前 cookie/会话上下文很敏感。只有遇到
-        # 传输层异常时，第二枪才 rebuild 并强制 HTTP/1.1 短连接兜底。
+        # 对 auth.openai.com 的当前 cookie/会话上下文很敏感。
+        # 直连遇到传输层异常时，第二枪 rebuild 并改用标准 requests（不同 TLS 栈）。
+        # 走代理时只需要一次尝试（requests 通过代理通常不被 Cloudflare 拦截）。
         if self.proxy or not rebuild_on_transport:
             attempts = [("current", False)]
         else:
@@ -276,8 +284,9 @@ class ChatGPTRegister:
 
         for mode, force_http1 in attempts:
             if force_http1:
-                # 兜底尝试用新连接，避免复用已经被对端关闭的 HTTP/2/TLS 连接。
-                self._rebuild_session()
+                # curl_cffi 的 TLS 指纹可能被 OpenAI 阻断（curl 55）。
+                # fallback 改用标准 requests，完全不同的 TLS 栈。
+                self._rebuild_session(force_requests=True)
             headers = {
                 **COMMON_HEADERS,
                 "referer": referer,
@@ -302,7 +311,8 @@ class ChatGPTRegister:
                 }
                 if allow_redirects is not None:
                     kwargs["allow_redirects"] = allow_redirects
-                if force_http1:
+                # 只有 curl_cffi session 才支持 http_version 参数
+                if force_http1 and hasattr(self.session, "impersonate"):
                     kwargs["http_version"] = CurlHttpVersion.V1_1
                 r = self.session.post(f"{AUTH}{path}", **kwargs)
                 ct = r.headers.get("content-type", "") if r is not None else ""
@@ -326,10 +336,7 @@ class ChatGPTRegister:
     # ---- Step 7: 验证 OTP 验证码 ----
     def validate_otp(self, code: str) -> dict:
         self._log(7, "POST /api/accounts/phone-otp/validate ...")
-        # 折中稳定版：
-        # - 保留 80de48b 的 authorize_continue Sentinel，避免 auth step 状态不完整；
-        # - 不再手写先生成 header 再 _rebuild_session 的旧流程，避免重新引入 curl 55；
-        # - 交给统一 fallback：第一枪当前会话，传输层失败时 rebuild + HTTP/1.1。
+        # 统一 fallback：第一枪 curl_cffi，直连失败时 fallback 到标准 requests。
         return self._post_auth_json_with_fallback(
             "/api/accounts/phone-otp/validate",
             {"code": code},

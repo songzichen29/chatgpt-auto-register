@@ -902,34 +902,17 @@ def run_second_half(
 
         elif "email_otp_verification" in page_type:
             # email_otp_verification 说明上次 Phase 2 部分完成，
-            # OpenAI 已发验证码到旧绑定邮箱，账号停留在待验证状态。
-            # 尝试重新发码到新邮箱，如果失败说明账号卡住了。
-            log("[5] email_otp_verification，尝试重新发码到新邮箱 ...")
-            history_codes = _get_email_history_codes(
-                msoutlook_helper_url, msoutlook_email, verbose,
-                msoutlook_helper_mode=msoutlook_helper_mode,
-                msoutlook_helper_script=msoutlook_helper_script,
-            )
-            if history_codes:
-                log(f"[7] 邮箱历史码 (将排除): {history_codes}")
-
-            if icloud_email:
-                r_send = flow.send_bind_email(icloud_email)
-                send_err = r_send.get("error", "")
-                send_page = (r_send.get("page") or {}).get("type", "")
-                log(f"[6] 重新发码: error={send_err} page={send_page}")
-                if send_err:
-                    # 发码失败，说明账号卡在旧邮箱验证状态，无法重新发码
-                    return {"ok": False, "error": f"account_stuck_email_otp: {send_err}"}
-                if "otp_verification" in send_page:
-                    log("[6] 新验证码已重新发送,等待收码...")
+            # OpenAI 已发验证码到邮箱，账号停留在待验证状态。
+            # 跳过 send_bind_email（在此状态下会返回 invalid_auth_step），
+            # 直接尝试从邮箱获取验证码并验证。
+            log("[5] email_otp_verification，跳过 add-email/send，直接获取验证码 ...")
 
             code_bind = bind_code
             if not code_bind:
                 code_bind = _poll_bind_code(
                     icloud_email, icloud_cookies, imap_user, imap_password,
                     msoutlook_helper_url, msoutlook_email, verbose, timeout=240,
-                    exclude_codes=history_codes or None,
+                    exclude_codes=None,
                     msoutlook_helper_mode=msoutlook_helper_mode,
                     msoutlook_helper_script=msoutlook_helper_script,
                 )
