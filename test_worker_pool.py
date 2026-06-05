@@ -16,22 +16,76 @@ import worker_pool
 
 
 class WorkerPoolComponentTests(unittest.TestCase):
-    def test_validate_otp_uses_plain_contact_verification_post(self):
+    def test_validate_otp_uses_authorize_continue_with_rebuild(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
-        calls = []
+        calls = {"sentinel": [], "rebuild": 0, "post": []}
 
-        def fake_post(path, payload, **kwargs):
-            calls.append((path, payload, kwargs))
-            return {"continue_url": "/about-you", "_status": 200}
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = '{"continue_url": "/about-you"}'
 
-        reg._post_auth_json_with_fallback = fake_post
+            def json(self):
+                return {"continue_url": "/about-you"}
+
+        class FakeSession:
+            def post(self, url, **kwargs):
+                calls["post"].append((url, kwargs))
+                return FakeResponse()
+
+        def fake_sentinel(headers, flow):
+            calls["sentinel"].append(flow)
+            headers["OpenAI-Sentinel-Token"] = "sentinel-token"
+
+        reg.session = FakeSession()
+        reg._add_sentinel_headers = fake_sentinel
+        reg._rebuild_session = lambda: calls.__setitem__("rebuild", calls["rebuild"] + 1)
         result = reg.validate_otp("123456")
 
         self.assertEqual(result["continue_url"], "/about-you")
-        self.assertEqual(calls[0][0], "/api/accounts/phone-otp/validate")
-        self.assertEqual(calls[0][1], {"code": "123456"})
-        self.assertIs(calls[0][2]["sentinel"], False)
-        self.assertIs(calls[0][2]["rebuild_on_transport"], False)
+        self.assertEqual(calls["sentinel"], ["authorize_continue"])
+        self.assertEqual(calls["rebuild"], 1)
+        self.assertEqual(calls["post"][0][0], "https://auth.openai.com/api/accounts/phone-otp/validate")
+        self.assertEqual(calls["post"][0][1]["json"], {"code": "123456"})
+        self.assertEqual(calls["post"][0][1]["headers"]["OpenAI-Sentinel-Token"], "sentinel-token")
+
+    def test_create_account_uses_oauth_create_account_with_rebuild(self):
+        reg = chatgpt_register.ChatGPTRegister(verbose=False)
+        calls = {"sentinel": [], "rebuild": 0, "post": []}
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = '{"continue_url": "https://callback.example"}'
+
+            def json(self):
+                return {"continue_url": "https://callback.example"}
+
+        class FakeSession:
+            def post(self, url, **kwargs):
+                calls["post"].append((url, kwargs))
+                return FakeResponse()
+
+        def fake_sentinel(headers, flow):
+            calls["sentinel"].append(flow)
+            headers["OpenAI-Sentinel-Token"] = "sentinel-token"
+
+        reg.session = FakeSession()
+        reg._add_sentinel_headers = fake_sentinel
+        reg._rebuild_session = lambda: calls.__setitem__("rebuild", calls["rebuild"] + 1)
+        result = reg.create_account("A", "2000-01-01")
+
+        self.assertEqual(result["continue_url"], "https://callback.example")
+        self.assertEqual(calls["sentinel"], ["oauth_create_account"])
+        self.assertEqual(calls["rebuild"], 1)
+        self.assertEqual(calls["post"][0][0], "https://auth.openai.com/api/accounts/create_account")
+        self.assertEqual(calls["post"][0][1]["json"], {"name": "A", "birthdate": "2000-01-01"})
+        self.assertIs(calls["post"][0][1]["allow_redirects"], False)
+
+    def test_create_account_invalid_state_is_non_retryable_auth_error(self):
+        self.assertTrue(auto_register._is_auth_session_invalid_error("invalid_state"))
+        self.assertTrue(auto_register._is_auth_session_invalid_error("Your sign-in session is no longer valid. Please start over."))
+        self.assertFalse(auto_register._is_auth_session_invalid_error("name is invalid"))
 
     def test_auto_register_cancel_with_eta_starts_background_job(self):
         calls = []

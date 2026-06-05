@@ -72,6 +72,19 @@ def _retry_call(fn, max_retries=2, delay=2, label=""):
                 print(f"  [{label}] 失败 ({e})，{delay}s 后重试 ({attempt+1}/{max_retries})...")
             _time.sleep(delay)
 
+def _is_auth_session_invalid_error(text: str) -> bool:
+    """识别服务端明确要求 start over 的 auth 状态错误。"""
+    low = str(text or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "invalid_state",
+            "session is no longer valid",
+            "start over",
+            "invalid authorization step",
+        )
+    )
+
 def _cancel_with_eta(sms, phone: str, reason: str, verbose: bool = True):
     """后台取消号码并打印资金安全提示。
 
@@ -396,6 +409,10 @@ def register_one(
             if verbose:
                 detail = last_create_error[:200]
                 print(f"  创建账户失败 [{ca_attempt+1}]: {detail}")
+            if _is_auth_session_invalid_error(last_create_error):
+                if verbose:
+                    print("  创建账户会话已失效，停止本轮创建重试")
+                break
             if ca_attempt < create_account_max_retries - 1:
                 _time.sleep(1)
 

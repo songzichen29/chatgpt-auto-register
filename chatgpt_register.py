@@ -326,28 +326,77 @@ class ChatGPTRegister:
     # ---- Step 7: 验证 OTP 验证码 ----
     def validate_otp(self, code: str) -> dict:
         self._log(7, "POST /api/accounts/phone-otp/validate ...")
-        # phone-otp/validate 属于 contact_verification 当前步骤。另一套稳定的
-        # OpenAI 后半段实现也是普通 JSON POST，不额外携带 authorize_continue
-        # Sentinel。给这里强塞 authorize_continue token 可能让服务端认为
-        # authorization step 不匹配，从而返回 session no longer valid。
-        return self._post_auth_json_with_fallback(
-            "/api/accounts/phone-otp/validate",
-            {"code": code},
-            referer=f"{AUTH}/contact-verification",
-            sentinel=False,
-            rebuild_on_transport=False,
-        )
+        headers = {
+            **COMMON_HEADERS,
+            "referer": f"{AUTH}/contact-verification",
+            "oai-device-id": self.device_id,
+        }
+        try:
+            self._add_sentinel_headers(headers, "authorize_continue")
+        except Exception:
+            pass
+
+        # 恢复 80de48b 的关键行为：OTP validate 前重建连接，但保留 Cookie。
+        # 这条链路对 auth 状态很敏感；只复用当前连接时，后续 create_account
+        # 容易出现 invalid_state。
+        self._rebuild_session()
+
+        r = None
+        error = ""
+        try:
+            r = self.session.post(
+                f"{AUTH}/api/accounts/phone-otp/validate",
+                json={"code": code},
+                headers=headers,
+                timeout=30,
+            )
+            ct = r.headers.get("content-type", "") if r is not None else ""
+            data = r.json() if ct.startswith("application/json") else {}
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            data = {}
+        data["_status"] = r.status_code if r is not None else 0
+        data["_body"] = r.text[:500] if r is not None and r.text else ""
+        if error:
+            data["_error"] = error[:500]
+        return data
 
     # ---- Step 8: 创建账户 (用户名+生日) ----
     def create_account(self, name: str, birthdate: str) -> dict:
         self._log(8, "POST /api/accounts/create_account ...")
-        return self._post_auth_json_with_fallback(
-            "/api/accounts/create_account",
-            {"name": name, "birthdate": birthdate},
-            referer=f"{AUTH}/about-you",
-            flow="oauth_create_account",
-            allow_redirects=False,
-        )
+        headers = {
+            **COMMON_HEADERS,
+            "referer": f"{AUTH}/about-you",
+            "oai-device-id": self.device_id,
+        }
+        try:
+            self._add_sentinel_headers(headers, "oauth_create_account")
+        except Exception:
+            pass
+
+        # 同样恢复旧实现：create_account 前重建连接，避免复用失效连接上下文。
+        self._rebuild_session()
+
+        r = None
+        error = ""
+        try:
+            r = self.session.post(
+                f"{AUTH}/api/accounts/create_account",
+                json={"name": name, "birthdate": birthdate},
+                headers=headers,
+                allow_redirects=False,
+                timeout=30,
+            )
+            ct = r.headers.get("content-type", "") if r is not None else ""
+            data = r.json() if ct.startswith("application/json") else {}
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            data = {}
+        data["_status"] = r.status_code if r is not None else 0
+        data["_body"] = r.text[:500] if r is not None and r.text else ""
+        if error:
+            data["_error"] = error[:500]
+        return data
 
     # ---- 访问 about-you 页面建立会话 ----
     def visit_about_you(self, continue_url: str):

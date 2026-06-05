@@ -706,7 +706,10 @@ def run_second_half(
             return {"ok": False, "error": f"verify_password: {r.get('error')}"}
         page_type = (r.get("page") or {}).get("type", "")
         log(f"[5] page: {page_type}")
-        print(f"  [DEBUG] page_type={repr(page_type)}, about_you={'about_you' in page_type}, consent={'consent' in page_type}, contact_verification={'contact_verification' in page_type}")
+        log(
+            f"[5] page flags: about_you={'about_you' in page_type}, "
+            f"consent={'consent' in page_type}, contact_verification={'contact_verification' in page_type}"
+        )
         code = None
 
         def _capture_code(continue_url: str, stage: str) -> Optional[str]:
@@ -772,56 +775,6 @@ def run_second_half(
                 "error": err,
                 "error_code": err_code,
             }
-
-        def _bind_email_and_continue(stage: str) -> Dict[str, Any]:
-            if not icloud_email:
-                return {"ok": False, "error": f"{stage}: missing bind email"}
-            log(f"[6] 绑定邮箱: {icloud_email} ...")
-            history_codes = _get_email_history_codes(
-                msoutlook_helper_url, msoutlook_email, verbose,
-                msoutlook_helper_mode=msoutlook_helper_mode,
-                msoutlook_helper_script=msoutlook_helper_script,
-            )
-            if history_codes:
-                log(f"[7] 邮箱历史码 (将排除): {history_codes}")
-            send_r = flow.send_bind_email(icloud_email)
-            if send_r.get("error"):
-                log(f"[6] 失败: {send_r.get('error')}")
-                return {"ok": False, "error": f"{stage}: send_bind_email: {send_r.get('error')}"}
-            log(f"[6] page: {(send_r.get('page') or {}).get('type', '?')}")
-
-            code_bind = bind_code
-            if not code_bind:
-                code_bind = _poll_bind_code(
-                    icloud_email, icloud_cookies, imap_user, imap_password,
-                    msoutlook_helper_url, msoutlook_email, verbose, timeout=240,
-                    exclude_codes=history_codes or None,
-                    msoutlook_helper_mode=msoutlook_helper_mode,
-                    msoutlook_helper_script=msoutlook_helper_script,
-                )
-                if not code_bind:
-                    print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email or msoutlook_email}")
-                    if interactive_input:
-                        code_bind = input("  [?] 输入6位验证码: ").strip()
-            if not code_bind:
-                return {"ok": False, "error": f"{stage}: binding code timeout"}
-            log(f"[7] 绑定验证码: {code_bind}")
-
-            verify_r = flow.verify_email_otp(code_bind)
-            if verify_r.get("error"):
-                log(f"[8] 失败: {verify_r.get('error')}")
-                return {"ok": False, "error": f"{stage}: verify_email_otp: {verify_r.get('error')}"}
-            next_page = (verify_r.get("page") or {}).get("type", "")
-            continue_url = verify_r.get("continue_url", "")
-            log(f"[8] page: {next_page or '?'}")
-
-            if "about_you" in next_page:
-                return _handle_about_you(f"{stage}_about_you")
-
-            captured = _capture_code(continue_url, stage)
-            if captured:
-                return {"ok": True, "code": captured, "page_type": next_page, "continue_url": continue_url}
-            return {"ok": True, "page_type": next_page, "continue_url": continue_url}
 
         def _handle_about_you(stage: str) -> Dict[str, Any]:
             about_r = _submit_about_you_once()
@@ -899,60 +852,6 @@ def run_second_half(
                 try:
                     log("[5.5] 从 SMS 平台等待验证码 ...")
                     code_contact = sms_obj.wait_for_code(phone_aid, timeout=120)
-                except Exception as e:
-                    log(f"[5.5] SMS 平台收码失败: {e}")
-            if not code_contact and interactive_input:
-                code_contact = input("  [?] 输入手机验证码 (6位): ").strip()
-            if not code_contact:
-                return {"ok": False, "error": "contact_verification code timeout"}
-            log(f"[5.5] 收到验证码: {code_contact}")
-            # 验证手机 OTP
-            r = flow.validate_contact_otp(code_contact)
-            if r.get("error"):
-                log(f"[5.5] 验证失败: {r.get('error')}")
-                return {"ok": False, "error": f"validate_contact_otp: {r.get('error')}"}
-            page_type = (r.get("page") or {}).get("type", "")
-            log(f"[5.5] 验证后 page: {page_type}")
-            # 继续后面的流程
-            if "about_you" in page_type:
-                log("[5.5] 验证后到 about_you，继续补资料 ...")
-                handled = _handle_about_you("contact_verification_about_you")
-                if not handled.get("ok"):
-                    return {"ok": False, "error": handled.get("error", "about_you after contact_verification failed")}
-                if handled.get("code"):
-                    code = handled["code"]
-                    page_type = "code_captured"
-                else:
-                    page_type = handled.get("page_type", "")
-                    continue_url = handled.get("continue_url", "")
-            if code:
-                pass
-            elif "consent" in page_type:
-                log("[5.5] 已到 consent 页，跳过绑邮箱")
-                dump = flow.get_session_dump()
-                workspaces = ((dump.get("client_auth_session") or {}).get("workspaces") or [])
-                if workspaces:
-                    ws_id = workspaces[0].get("id", "")
-                    log(f"[9] 工作区: {ws_id}")
-                    ws_r = flow.select_workspace(ws_id)
-                    continue_url = ws_r.get("continue_url", "")
-                else:
-                    continue_url = ""
-                code = flow.follow_continue_until_code(continue_url) if continue_url else None
-                if not code:
-                    code = flow.final_oauth(oauth_params)
-                if not code:
-                    return {"ok": False, "error": "no authorization code after contact_verification"}
-
-        elif "contact_verification" in page_type:
-            # 已有账号，密码验证后需要验证手机 OTP
-            log("[5] contact_verification，需要验证手机 OTP ...")
-            # 从 SMS 平台收码
-            code_contact = bind_code
-            if not code_contact:
-                log("[5.5] 从 SMS 平台等待验证码 ...")
-                try:
-                    code_contact = sms_obj.wait_for_code(phone_aid, timeout=180)
                 except Exception as e:
                     log(f"[5.5] SMS 平台收码失败: {e}")
             if not code_contact and interactive_input:
