@@ -592,27 +592,70 @@ class AccountStore:
         state[source_key] = entry
         self.save_state(state)
 
-    def delete_failed_record(self, key: str, *, restore_email: bool = True) -> dict:
-        key = unquote(key)
-        records = self.load_results()
-        target = next((r for r in records if account_key(r) == key), None)
-        if not target:
-            return {"ok": False, "error": "记录不存在"}
-        status = normalize_reg_status(target)
-        if status == "ok":
-            return {"ok": False, "error": "成功账号不能在失败记录里删除"}
+    def _restore_pool_email(self, email: str) -> bool:
+        email = normalize_email(email)
+        if not email:
+            return False
+        restored = False
+        try:
+            from msoutlook_pool import MsOutlookPool
+            pool = MsOutlookPool(pool_path=str(self.paths["pool"]), used_file=str(self.paths["used"]), verbose=False)
+            pool.mark_unused(email)
+            restored = True
+        except Exception:
+            restored = False
+        try:
+            pool_items = read_json(self.paths["pool"], [])
+            pool_changed = False
+            if isinstance(pool_items, list):
+                for item in pool_items:
+                    if isinstance(item, dict) and normalize_email(item.get("email")) == email and item.get("used"):
+                        item["used"] = False
+                        pool_changed = True
+                if pool_changed:
+                    write_json_atomic(self.paths["pool"], pool_items)
+                    restored = True
+        except Exception:
+            pass
+        return restored
 
-        email = normalize_email(target.get("bind_email") or target.get("email"))
-        kept = [r for r in records if account_key(r) != key]
-        deleted_count = len(records) - len(kept)
+    def delete_failed_records(self, scope: str, keys: Iterable[str], filters: dict, *, restore_email: bool = True) -> dict:
+        scope = str(scope or "selected").strip().lower()
+        if scope == "filtered":
+            scoped_filters = dict(filters or {})
+            scoped_filters["failed_only"] = "1"
+            target_keys = {item["key"] for item in self.resolve_items("filtered", [], scoped_filters) if item.get("reg_status") != "ok"}
+        else:
+            target_keys = {unquote(str(k)) for k in (keys or []) if str(k).strip()}
+        if not target_keys:
+            return {"ok": False, "error": "请选择要删除的失败记录"}
+
+        records = self.load_results()
+        deleted: list[dict] = []
+        kept: list[dict] = []
+        skipped_success = 0
+        for record in records:
+            key = account_key(record)
+            if key not in target_keys:
+                kept.append(record)
+                continue
+            if normalize_reg_status(record) == "ok":
+                skipped_success += 1
+                kept.append(record)
+                continue
+            deleted.append(record)
+        if not deleted:
+            return {"ok": False, "error": "没有可删除的失败记录", "skipped_success": skipped_success}
+
         write_json_atomic(self.paths["all_results"], kept)
 
+        deleted_keys = {account_key(record) for record in deleted}
         removed_files = 0
         for path in self.paths["results_dir"].glob("*.json"):
             if path.name in {"_all.json", "account_state.json", "pool_import_history.json"}:
                 continue
             payload = read_json(path, None)
-            if isinstance(payload, dict) and account_key(payload) == key:
+            if isinstance(payload, dict) and account_key(payload) in deleted_keys:
                 try:
                     path.unlink()
                     removed_files += 1
@@ -620,38 +663,30 @@ class AccountStore:
                     pass
 
         state = self.load_state()
-        state.pop(key, None)
+        for key in deleted_keys:
+            state.pop(key, None)
         self.save_state(state)
 
-        restored = False
-        if restore_email and email:
-            try:
-                from msoutlook_pool import MsOutlookPool
-                pool = MsOutlookPool(pool_path=str(self.paths["pool"]), used_file=str(self.paths["used"]), verbose=False)
-                pool.mark_unused(email)
-                restored = True
-            except Exception:
-                restored = False
-            try:
-                pool_items = read_json(self.paths["pool"], [])
-                pool_changed = False
-                if isinstance(pool_items, list):
-                    for item in pool_items:
-                        if isinstance(item, dict) and normalize_email(item.get("email")) == email and item.get("used"):
-                            item["used"] = False
-                            pool_changed = True
-                    if pool_changed:
-                        write_json_atomic(self.paths["pool"], pool_items)
-                        restored = True
-            except Exception:
-                pass
+        restored_emails: list[str] = []
+        if restore_email:
+            emails = sorted({normalize_email(r.get("bind_email") or r.get("email")) for r in deleted if normalize_email(r.get("bind_email") or r.get("email"))})
+            for email in emails:
+                if self._restore_pool_email(email):
+                    restored_emails.append(email)
 
         return {
             "ok": True,
-            "deleted": deleted_count,
+            "deleted": len(deleted),
+            "requested": len(target_keys),
+            "skipped_success": skipped_success,
             "removed_files": removed_files,
-            "restored_email": email if restored else "",
+            "restored": len(restored_emails),
+            "restored_emails": restored_emails,
+            "restored_email": restored_emails[0] if len(restored_emails) == 1 else "",
         }
+
+    def delete_failed_record(self, key: str, *, restore_email: bool = True) -> dict:
+        return self.delete_failed_records("selected", [key], {}, restore_email=restore_email)
 
 
 def apply_state_patch(entry: dict, patch: dict) -> None:
@@ -1443,6 +1478,15 @@ def create_worker_control_blueprint(root: Path, worker_controller: Optional[Work
         try:
             restore = bool((request.json or {}).get("restore_email", True)) if request.is_json else True
             return jsonify(store.delete_failed_record(key, restore_email=restore))
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)})
+
+    @bp.route("/api/accounts/failed/batch-delete", methods=["POST"])
+    def api_failed_accounts_batch_delete():
+        d = request.json or {}
+        try:
+            restore = bool(d.get("restore_email", True))
+            return jsonify(store.delete_failed_records(d.get("scope") or "selected", d.get("keys") or [], d.get("filters") or {}, restore_email=restore))
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)})
 
