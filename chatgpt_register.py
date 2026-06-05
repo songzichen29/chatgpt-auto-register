@@ -260,13 +260,17 @@ class ChatGPTRegister:
         Sentinel、再 rebuild session，会让 token 来自旧连接上下文；在 OTP validate
         这种敏感接口上更容易触发 curl_cffi 的 curl: (55) send failure。
         """
-        attempts = [False] if self.proxy else [False, True]
+        # 第一枪必须使用当前会话：OTP send 和 validate 之间的授权步骤
+        # 对 auth.openai.com 的当前 cookie/会话上下文很敏感。只有遇到
+        # 传输层异常时，第二枪才 rebuild 并强制 HTTP/1.1 短连接兜底。
+        attempts = [("current", False)] if self.proxy else [("current", False), ("http1-rebuild", True)]
         last_data: dict = {}
         errors = []
 
-        for force_http1 in attempts:
-            # 每次尝试都用新连接，避免复用已经被对端关闭的 HTTP/2/TLS 连接。
-            self._rebuild_session()
+        for mode, force_http1 in attempts:
+            if force_http1:
+                # 兜底尝试用新连接，避免复用已经被对端关闭的 HTTP/2/TLS 连接。
+                self._rebuild_session()
             headers = {
                 **COMMON_HEADERS,
                 "referer": referer,
@@ -275,6 +279,7 @@ class ChatGPTRegister:
             if force_http1:
                 headers["connection"] = "close"
             try:
+                self._sentinel_cache.pop(flow, None)
                 self._add_sentinel_headers(headers, flow)
             except Exception:
                 pass
@@ -301,12 +306,11 @@ class ChatGPTRegister:
             data["_status"] = r.status_code if r is not None else 0
             data["_body"] = r.text[:500] if r is not None and r.text else ""
             if error:
-                mode = "http1" if force_http1 else "default"
                 errors.append(f"{mode}: {error}")
                 data["_error"] = " | ".join(errors)[-500:]
                 last_data = data
                 continue
-            data["_transport"] = "http1" if force_http1 else "default"
+            data["_transport"] = mode
             return data
 
         return last_data

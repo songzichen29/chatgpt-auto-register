@@ -209,23 +209,28 @@ def register_one(
             if verbose:
                 print(f"  手机号: {phone}  激活ID: {aid}  [平台:{sms_provider}]")
 
-        reg = ChatGPTRegister(proxy=config["proxy"])
+        def _start_registration_session(reason: str = "") -> tuple[ChatGPTRegister, str]:
+            if verbose and reason:
+                print(f"  [session] {reason}，重新开始登录会话")
+            reg_obj = ChatGPTRegister(proxy=config["proxy"])
+            _retry_call(lambda: reg_obj.visit(), sr, label="访问首页")
+            csrf = _retry_call(lambda: reg_obj.get_csrf(), sr, label="CSRF")
+            redirect = _retry_call(lambda: reg_obj.signin(phone, csrf), sr, label="发起登录")
+            if not redirect:
+                raise RuntimeError("signin 无返回(可能被 Cloudflare 拦截)")
+            _retry_call(lambda: reg_obj.jump_to_auth(redirect), sr, label="OAuth跳转")
+            register_result = _retry_call(lambda: reg_obj.register_user(phone, password), sr, label="注册")
+            next_url = register_result.get("continue_url", "")
+            if not next_url:
+                raise RuntimeError(f"注册被拒(status={register_result.get('_status')})")
+            return reg_obj, next_url
 
-        _retry_call(lambda: reg.visit(), sr, label="访问首页")
-        csrf = _retry_call(lambda: reg.get_csrf(), sr, label="CSRF")
-        redirect = _retry_call(lambda: reg.signin(phone, csrf), sr, label="发起登录")
-        if not redirect:
+        try:
+            reg, continue_url = _start_registration_session()
+        except Exception as exc:
             if auto_activate:
-                _cancel_with_eta(sms, phone, "signin 无返回", verbose)
-            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": "signin 无返回(可能被 Cloudflare 拦截)"}
-        _retry_call(lambda: reg.jump_to_auth(redirect), sr, label="OAuth跳转")
-        result = _retry_call(lambda: reg.register_user(phone, password), sr, label="注册")
-
-        continue_url = result.get("continue_url", "")
-        if not continue_url:
-            if auto_activate:
-                _cancel_with_eta(sms, phone, "注册被拒", verbose)
-            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": f"注册被拒(status={result.get('_status')})"}
+                _cancel_with_eta(sms, phone, "注册会话失败", verbose)
+            return {"ok": False, "phone": phone, "password": password, "activation_id": aid, "error": str(exc)}
 
         # ---- OTP 验证 ----
         # 保存注册步骤的 continue_url，校验失败重试时需要重新触发 send_otp
@@ -263,6 +268,41 @@ def register_one(
                 status_code = int(result.get("_status") or 0)
             except Exception:
                 status_code = 0
+
+            detail_lc = detail.lower()
+            session_invalid = (
+                status_code == 409
+                and (
+                    "session is no longer valid" in detail_lc
+                    or "start over" in detail_lc
+                    or "invalid authorization step" in detail_lc
+                )
+            )
+            if session_invalid:
+                if otp_attempt < otp_max_retries - 1:
+                    used_otp_codes.add(str(code).strip())
+                    try:
+                        reg, send_otp_url = _start_registration_session("OTP 会话失效")
+                        _retry_call(lambda u=send_otp_url: reg.send_otp(u), sr, label="重新发送验证码")
+                    except Exception as exc:
+                        _last_otp_error = f"OTP 会话重建失败: {exc}"
+                        break
+                    if verbose:
+                        print(
+                            f"  {_last_otp_error}，[OTP重试 {otp_attempt + 1}/{otp_max_retries - 1}] "
+                            f"已重建登录会话并请求新验证码到 {phone}"
+                        )
+                    code = sms.wait_code(timeout=config["code_timeout"], exclude_codes=list(used_otp_codes))
+                    if not code:
+                        _last_otp_error = "会话重建后验证码超时"
+                        break
+                    used_otp_codes.add(str(code).strip())
+                    if verbose:
+                        print(f"  收到验证码: {code}")
+                    continue
+                if verbose:
+                    print(f"  {_last_otp_error}，已用完重试次数")
+                break
 
             # status=0 表示 validate 请求本身没有拿到 HTTP 响应，多半是连接/TLS/超时等
             # 传输层异常；这时不能把它当成"验证码错误"去请求短信平台重发，
