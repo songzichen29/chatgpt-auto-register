@@ -193,6 +193,19 @@ def _get_sms_api_key(config: dict, provider: str) -> str:
     return config.get(section, {}).get("api_key", "") or config.get("smsbower", {}).get("api_key", "")
 
 
+def _looks_existing_or_auth_step_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "invalid authorization step",
+            "invalid_auth_step",
+            "phone number already in use",
+            "phone_number_in_use",
+        )
+    )
+
+
 # ============================================================
 # 注册核心
 # ============================================================
@@ -339,9 +352,33 @@ def register_one(
                     used_otp_codes.add(str(code).strip())
                     try:
                         reg, send_otp_url = _start_registration_session("OTP 会话失效")
+                        try:
+                            resend_result = sms.resend()
+                            if verbose and resend_result:
+                                print(f"  [sms] 已请求平台接收下一条短信: {str(resend_result)[:120]}")
+                        except Exception as e:
+                            if verbose:
+                                print(f"  [sms] 平台请求接收下一条短信失败，继续尝试 OpenAI 发码: {e}")
                         _retry_call(lambda u=send_otp_url: reg.send_otp(u), sr, label="重新发送验证码")
                     except Exception as exc:
                         _last_otp_error = f"OTP 会话重建失败: {exc}"
+                        if _looks_existing_or_auth_step_error(exc):
+                            if verbose:
+                                print(
+                                    "  [session] OTP 后账号可能已进入已注册/半注册状态，"
+                                    "不再重复 register，交给 Phase 2 登录/绑定流程处理"
+                                )
+                            return {
+                                "ok": True,
+                                "phone": phone,
+                                "password": password,
+                                "name": name,
+                                "birthdate": birthdate,
+                                "session_token": "",
+                                "access_token": "",
+                                "activation_id": aid,
+                                "phase1_note": _last_otp_error,
+                            }
                         break
                     if verbose:
                         print(

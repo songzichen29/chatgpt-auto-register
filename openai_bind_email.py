@@ -892,7 +892,7 @@ def run_second_half(
             continue_url = about_r.get("continue_url", "")
             err_code = about_r.get("error_code", "")
             if err_code == "missing_email":
-                log(f"[5] {stage}: create_account 返回 missing_email，需先用 ChatGPT client 补 about_you 后重跑 Codex OAuth")
+                log(f"[5] {stage}: create_account missing_email; retry with ChatGPT client about_you before Codex OAuth")
                 return {
                     "ok": False,
                     "error": f"codex_about_you_missing_email: {stage}",
@@ -1092,10 +1092,23 @@ def run_second_half(
             if r.get("error"):
                 log(f"[8] 失败: {r.get('error')}")
                 return {"ok": False, "error": f"verify_email_otp: {r.get('error')}"}
-            log(f"[8] page: {(r.get('page') or {}).get('type', '?')}")
+            verify_page_type = (r.get("page") or {}).get("type", "")
+            log(f"[8] page: {verify_page_type or '?'}")
             continue_url = r.get("continue_url", "")
 
-            if not continue_url:
+            if "about_you" in verify_page_type:
+                log("[8] 邮箱验证后到 about_you，继续补资料 ...")
+                handled = _handle_about_you("email_verified_about_you")
+                if not handled.get("ok"):
+                    return {"ok": False, "error": handled.get("error", "about_you after email verification failed")}
+                if handled.get("code"):
+                    code = handled["code"]
+                    continue_url = ""
+                else:
+                    verify_page_type = handled.get("page_type", "")
+                    continue_url = handled.get("continue_url", "")
+
+            if not code and not continue_url:
                 dump = flow.get_session_dump()
                 workspaces = ((dump.get("client_auth_session") or {}).get("workspaces") or [])
                 if workspaces:
@@ -1103,7 +1116,7 @@ def run_second_half(
                     ws_r = flow.select_workspace(ws_id)
                     continue_url = ws_r.get("continue_url", "")
 
-            code = flow.follow_continue_until_code(continue_url) if continue_url else None
+            code = code or (flow.follow_continue_until_code(continue_url) if continue_url else None)
             if not code:
                 code = flow.final_oauth(oauth_params)
             if not code:
