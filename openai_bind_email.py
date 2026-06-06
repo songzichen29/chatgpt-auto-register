@@ -61,6 +61,29 @@ def _log(msg: str):
     print(f"  [AUTH] {msg}")
 
 
+MSOUTLOOK_UNREADABLE_ERROR = "msoutlook_unreadable"
+MSOUTLOOK_FATAL_KEYWORDS = (
+    "invalid_grant",
+    "security interrupt",
+    "account security interrupt",
+    "compromised",
+    "aadsts70000",
+    "refresh_token_or_scope_invalid",
+    "refresh token invalid",
+    "refresh_token invalid",
+    "刷新令牌无效",
+)
+
+
+def _is_msoutlook_fatal_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return any(keyword in text for keyword in MSOUTLOOK_FATAL_KEYWORDS)
+
+
+def _msoutlook_unreadable_error(error: object) -> str:
+    return f"{MSOUTLOOK_UNREADABLE_ERROR}: {error}"
+
+
 # ============================================================
 # Sentinel PoW (简化版，内联用)
 # ============================================================
@@ -560,6 +583,8 @@ def _poll_bind_code(icloud_email, icloud_cookies, imap_user, imap_password,
                 return code
             _l("[7] MsOutlook 超时，尝试回退到 iCloud")
         except Exception as e:
+            if _is_msoutlook_fatal_error(e):
+                raise RuntimeError(_msoutlook_unreadable_error(e)) from e
             _l(f"[7] MsOutlook 失败: {e}，回退到 iCloud")
 
     # 回退到 iCloud
@@ -621,7 +646,9 @@ def _get_email_history_codes(msoutlook_helper_url: str, msoutlook_email: str,
                 seen.add(c)
                 uniq.append(c)
         return uniq
-    except Exception:
+    except Exception as e:
+        if _is_msoutlook_fatal_error(e):
+            raise RuntimeError(_msoutlook_unreadable_error(e)) from e
         return []
 
 
@@ -840,6 +867,16 @@ def run_second_half(
         elif "contact_verification" in page_type:
             # 已有账号，密码验证后需要验证手机号 OTP
             log("[5] contact_verification，需要验证手机 OTP ...")
+            if not (bind_code or (sms_obj and phone_aid) or interactive_input):
+                # batch_phase2 这类“已注册账号续跑 Phase 2”场景没有 SMS activation_id，
+                # 也不应该为了续跑主动重发短信或阻塞 input。
+                # worker_pool 刚跑完 Phase 1，持有 activation_id，会通过 sms_obj/phone_aid
+                # 进入下面的自动收码流程。
+                # 这里直接返回账号状态异常，让外层跳过/记录，不触碰邮箱池。
+                return {
+                    "ok": False,
+                    "error": "account_requires_contact_verification",
+                }
             # 请求重发短信 OTP
             r_send = flow.resend_contact_otp()
             if r_send.get("error"):
@@ -847,7 +884,7 @@ def run_second_half(
                 return {"ok": False, "error": f"resend_contact_otp: {r_send.get('error')}"}
             log("[5.5] 已请求重发短信，等待验证码 ...")
             # 从 SMS 平台收码
-            code_contact = ""
+            code_contact = str(bind_code or "").strip()
             if sms_obj and phone_aid:
                 try:
                     log("[5.5] 从 SMS 平台等待验证码 ...")
@@ -901,10 +938,9 @@ def run_second_half(
             pass
 
         elif "email_otp_verification" in page_type:
-            # email_otp_verification 说明上次 Phase 2 部分完成，
-            # OpenAI 已发验证码到邮箱，账号停留在待验证状态。
-            # 跳过 send_bind_email（在此状态下会返回 invalid_auth_step），
-            # 直接尝试从邮箱获取验证码并验证。
+            # email_otp_verification 说明账号已经在待邮箱验证码状态。
+            # 这个状态下下一步应是读取邮箱验证码并调用 email-otp/validate；
+            # 再调用 add-email/send 会被服务端判定为 invalid_auth_step。
             log("[5] email_otp_verification，跳过 add-email/send，直接获取验证码 ...")
 
             code_bind = bind_code
@@ -924,7 +960,6 @@ def run_second_half(
                 return {"ok": False, "error": "binding code timeout"}
             log(f"[7] 验证码: {code_bind}")
 
-            # 验证 + workspace + 取 code
             r = flow.verify_email_otp(code_bind)
             if r.get("error"):
                 log(f"[8] 失败: {r.get('error')}")
@@ -950,11 +985,15 @@ def run_second_half(
             # 需要绑定新邮箱 (add_email)
             log(f"[6] 绑定邮箱: {icloud_email} ...")
             # 在 send_bind_email 之前取邮箱所有历史码，作为 exclude 列表
-            history_codes = _get_email_history_codes(
-                msoutlook_helper_url, msoutlook_email, verbose,
-                msoutlook_helper_mode=msoutlook_helper_mode,
-                msoutlook_helper_script=msoutlook_helper_script,
-            )
+            try:
+                history_codes = _get_email_history_codes(
+                    msoutlook_helper_url, msoutlook_email, verbose,
+                    msoutlook_helper_mode=msoutlook_helper_mode,
+                    msoutlook_helper_script=msoutlook_helper_script,
+                )
+            except RuntimeError as e:
+                log(f"[7] 邮箱预检失败，停止发送绑定邮件: {e}")
+                return {"ok": False, "error": str(e)}
             if history_codes:
                 log(f"[7] 邮箱历史码 (将排除): {history_codes}")
             r = flow.send_bind_email(icloud_email)

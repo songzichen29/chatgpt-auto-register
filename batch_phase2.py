@@ -46,6 +46,15 @@ SUB2API_PWD = _SUB2API.get("pwd") or _PHASE2.get("sub2api_password") or ""
 MSOUTLOOK_HELPER = _nested(_CONFIG, "msoutlook", "helper_url") or _PHASE2.get("msoutlook_helper_url") or "http://127.0.0.1:17373"
 MAX_EMAIL_RETRIES = 10
 MAX_OAUTH_RETRIES = 3  # exchange-code 失败后重跑 OAuth 的次数
+FATAL_EMAIL_KEYWORDS = (
+    "msoutlook_unreadable",
+    "compromised",
+    "invalid_grant",
+    "security interrupt",
+    "aadsts70000",
+    "refresh_token_or_scope_invalid",
+    "刷新令牌无效",
+)
 
 # 状态文件
 STATUS_FILE = Path("batch_phase2_status.json")
@@ -123,6 +132,7 @@ def run_phase2_for_phone(phone, pool):
                     sub2api_proxy_id=0,
                     msoutlook_helper_url=MSOUTLOOK_HELPER,
                     msoutlook_email=current_email,
+                    interactive_input=False,
                 )
 
                 if result.get("ok"):
@@ -143,10 +153,40 @@ def run_phase2_for_phone(phone, pool):
                             print(f"  [ERROR] 号池无可用邮箱")
                             return {"ok": False, "phone": phone, "password": PASSWORD, "error": "号池无可用邮箱"}
                         break  # 跳出 OAuth 重试，进入下一个邮箱
+                    elif any(kw in err.lower() for kw in FATAL_EMAIL_KEYWORDS):
+                        print(f"  [WARN] 邮箱不可读/令牌失效，标记坏邮箱并换邮箱...")
+                        pool.mark_error(current_email, "token_compromised", phone=phone, password=PASSWORD)
+                        current_email = pool.get_available_email()
+                        if not current_email:
+                            print(f"  [ERROR] 号池无可用邮箱")
+                            return {"ok": False, "phone": phone, "password": PASSWORD, "error": "号池无可用邮箱"}
+                        break  # 跳出 OAuth 重试，进入下一个邮箱
                     elif "exchange-code" in err:
                         # exchange-code 失败，auth code 可能已过期，重跑 OAuth
                         print(f"  [WARN] exchange-code 失败，重跑 OAuth...")
                         continue
+                    elif "account_stuck_email_otp" in err:
+                        # 账号状态问题，不证明当前选中的 Outlook 邮箱不可用。
+                        print(f"  [ERROR] 账号卡在 email_otp 状态，当前邮箱不标记为坏邮箱")
+                        return {
+                            "ok": False,
+                            "phone": phone,
+                            "password": PASSWORD,
+                            "bind_email": current_email,
+                            "error": err or "account_stuck_email_otp",
+                        }
+                    elif "account_requires_contact_verification" in err or "contact_verification code timeout" in err:
+                        # batch_phase2 是已注册账号的 Phase 2 续跑/上传，不持有 SMS activation_id。
+                        # 如果登录触发 contact_verification，说明账号状态需要额外验证；
+                        # 这不是当前 Outlook 邮箱的问题，不能标记邮箱错误，也不应在这里重发/等待短信。
+                        print(f"  [ERROR] 账号触发 contact_verification，batch_phase2 跳过该账号")
+                        return {
+                            "ok": False,
+                            "phone": phone,
+                            "password": PASSWORD,
+                            "bind_email": current_email,
+                            "error": err or "account_requires_contact_verification",
+                        }
                     else:
                         print(f"  [ERROR] Phase 2 失败: {err[:200]}")
                         return {

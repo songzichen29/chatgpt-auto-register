@@ -292,6 +292,7 @@ class WorkerProcessController:
         create_retry = parse_int(params.get("create_retry"), 20, min_value=1)
         cooldown = parse_float(params.get("cooldown"), 60.0, min_value=0.0)
         phase2_timeout = parse_float(params.get("phase2_timeout"), 300.0, min_value=1.0)
+        max_attempts = parse_int(params.get("max_attempts"), 0, min_value=0)
         config_path = str(params.get("config") or (self.root / "config.json"))
         cmd = [
             sys.executable, str(self.root / "worker_pool.py"),
@@ -302,13 +303,26 @@ class WorkerProcessController:
         max_price = str(params.get("max_price") or "").strip()
         if max_price:
             cmd.extend(["--max-price", max_price])
+        reuse_phone = str(params.get("reuse_phone") or "").strip()
+        reuse_activation_id = str(params.get("reuse_activation_id") or "").strip()
+        if reuse_phone or reuse_activation_id:
+            if not (reuse_phone and reuse_activation_id):
+                raise ValueError("复用手机号和 activation_id 必须同时填写")
+            if max_attempts <= 0:
+                max_attempts = 1
+            cmd.extend(["--reuse-phone", reuse_phone, "--reuse-activation-id", reuse_activation_id])
+        if max_attempts:
+            cmd.extend(["--max-attempts", str(max_attempts)])
         return cmd
 
     def start(self, params: dict, *, command: Optional[list[str]] = None) -> tuple[bool, dict]:
         with self.lock:
             if self.process and self.process.poll() is None:
                 return False, {"error": "已有运行中的 worker_pool 任务"}
-            cmd = command or self.build_worker_command(params)
+            try:
+                cmd = command or self.build_worker_command(params)
+            except Exception as exc:
+                return False, {"error": str(exc)}
             run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
             try:
@@ -1266,7 +1280,12 @@ class RetryController:
             self.stop_event = threading.Event()
             self.run = {"id": run_id, "stage": stage, "total": len(items), "done": 0, "started_at": utc_now(), "ended_at": "", "running": True}
         if stage == "full":
-            ok, data = self.worker_controller.start({"count": len(items), **options})
+            max_items = parse_int(options.get("max_items"), len(items), min_value=1)
+            count = min(len(items), max_items)
+            start_options = dict(options)
+            start_options["count"] = count
+            start_options.setdefault("max_attempts", count)
+            ok, data = self.worker_controller.start(start_options)
             if not ok:
                 with self.lock:
                     self.run["running"] = False
@@ -1316,6 +1335,7 @@ class RetryController:
         import auto_register as ar
         from msoutlook_pool import MsOutlookPool, load_used_set
         from openai_bind_email import run_second_half
+        from phone_sms import PhoneSMS
         from worker_pool import ResultWriter
 
         cfg = ar.load_config(str(self.root / "config.json"))
@@ -1328,10 +1348,21 @@ class RetryController:
             raise RuntimeError("缺少 SUB2API 或 MsOutlook 配置")
         phone = item.get("phone") or ""
         password = item.get("password") or ""
+        activation_id = str(item.get("activation_id") or "").strip()
         if not (phone and password):
             raise RuntimeError("缺少 phone/password，无法 Phase 2 续跑")
+        sms_obj = None
+        if activation_id:
+            provider = cfg.get("sms_provider", "smsbower")
+            api_key = ar._get_sms_api_key(cfg, provider)
+            if api_key:
+                sms_obj = PhoneSMS(provider, api_key)
 
         pool = MsOutlookPool(helper_url=helper_url, verbose=False, extra_used=load_used_set())
+        fatal_email_keywords = (
+            "msoutlook_unreadable", "compromised", "invalid_grant",
+            "security interrupt", "aadsts70000", "refresh_token_or_scope_invalid", "刷新令牌无效",
+        )
         for _ in range(10):
             current_email = pool.get_available_email()
             if not current_email:
@@ -1367,12 +1398,15 @@ class RetryController:
                 msoutlook_helper_mode=str(cfg.get("msoutlook", {}).get("helper_mode") or "http"),
                 msoutlook_helper_script=str(cfg.get("msoutlook", {}).get("helper_script") or ""),
                 save_import=False, interactive_input=False,
+                sms_obj=sms_obj,
+                phone_aid=activation_id,
             )
             if result.get("ok"):
                 pool.mark_used(current_email, phone=phone, password=password)
                 writer = ResultWriter(self.root / "results", self.root / "imports")
                 record = {
                     "status": "ok", "phone": phone, "password": password, "bind_email": current_email,
+                    "activation_id": activation_id,
                     "sub2api_id": result.get("sub2api_account_id", ""), "phase2_error": "", "saved_at": utc_now(),
                 }
                 writer.append_account(record)
@@ -1383,6 +1417,9 @@ class RetryController:
             err = result.get("error", "")
             if "email_already_in_use" in err:
                 pool.mark_error(current_email, "email_already_in_use", phone=phone, password=password)
+                continue
+            if any(kw in err.lower() for kw in fatal_email_keywords):
+                pool.mark_error(current_email, "token_compromised", phone=phone, password=password)
                 continue
             raise RuntimeError(err or "Phase 2 retry failed")
         raise RuntimeError("换邮箱重试耗尽")

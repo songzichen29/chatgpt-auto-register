@@ -43,6 +43,13 @@ RETRYABLE_PHASE2_KEYWORDS = (
     "504",
     "exchange-code",
 )
+PHONE_STATE_PHASE2_KEYWORDS = (
+    "account_requires_contact_verification",
+    "contact_verification code timeout",
+    "validate_contact_otp",
+    "phone-otp",
+    "resend_contact_otp",
+)
 FATAL_PHASE1_KEYWORDS = (
     "NO_BALANCE",
     "NO_NUMBERS",
@@ -51,9 +58,13 @@ FATAL_PHASE1_KEYWORDS = (
     "余额",
 )
 FATAL_EMAIL_KEYWORDS = (
+    "msoutlook_unreadable",
     "compromised",
     "invalid_grant",
     "security interrupt",
+    "aadsts70000",
+    "refresh_token_or_scope_invalid",
+    "刷新令牌无效",
 )
 
 
@@ -361,8 +372,9 @@ class Phase2Outcome:
 
 
 class RunState:
-    def __init__(self, target_success: int):
+    def __init__(self, target_success: int, max_attempts: int = 0):
         self.target_success = target_success
+        self.max_attempts = max(0, int(max_attempts or 0))
         self.lock = threading.RLock()
         self.full_success = 0
         self.phase1_failed = 0
@@ -373,7 +385,9 @@ class RunState:
 
     def should_continue(self, stop_event: threading.Event) -> bool:
         with self.lock:
-            return not stop_event.is_set() and self.full_success < self.target_success
+            if stop_event.is_set() or self.full_success >= self.target_success:
+                return False
+            return self.max_attempts <= 0 or self.attempts < self.max_attempts
 
     def record_attempt(self) -> int:
         with self.lock:
@@ -405,6 +419,7 @@ class RunState:
         with self.lock:
             return {
                 "target_success": self.target_success,
+                "max_attempts": self.max_attempts,
                 "full_success": self.full_success,
                 "phase1_failed": self.phase1_failed,
                 "phase2_failed": self.phase2_failed,
@@ -508,12 +523,25 @@ def _run_phase2_with_retry(
     stop_event: threading.Event,
     total_timeout: float = 300.0,
     max_retries: int = 3,
+    activation_id: str = "",
 ) -> Phase2Outcome:
     sub = cfg.get("sub2api", {})
     sub_url = (sub.get("url") or "").rstrip("/")
     sub_email = sub.get("email") or ""
     sub_pwd = sub.get("pwd") or ""
     active_lease: Optional[EmailLease] = initial_lease
+    phone_aid = str(activation_id or phase1_result.get("activation_id") or "").strip()
+    sms_obj = None
+    if phone_aid:
+        provider = cfg.get("sms_provider", "smsbower")
+        api_key = ar._get_sms_api_key(cfg, provider)
+        if api_key:
+            try:
+                sms_obj = PhoneSMS(provider, api_key)
+            except Exception as exc:
+                log(f"Phase2 SMS 客户端初始化失败: {exc}", "warn")
+        else:
+            log("Phase2 有 activation_id 但缺少 SMS API key，无法自动处理 contact_verification", "warn")
     start = time.time()
     retry_count = 0
     last_error = ""
@@ -561,6 +589,8 @@ def _run_phase2_with_retry(
             msoutlook_helper_script=str(cfg.get("msoutlook", {}).get("helper_script") or ""),
             save_import=False,
             interactive_input=False,
+            sms_obj=sms_obj,
+            phone_aid=phone_aid,
         )
 
         if oauth_result.get("ok"):
@@ -595,6 +625,14 @@ def _run_phase2_with_retry(
 
         if "account_stuck_email_otp" in last_error:
             log("账号卡在 email_otp 状态，无法重试", "error")
+            break
+
+        if any(kw in last_error for kw in PHONE_STATE_PHASE2_KEYWORDS):
+            # worker_pool 的 Phase 2 紧接 Phase 1，持有同一号码的 activation_id，
+            # run_second_half 已经拿这个 activation 尝试过 contact_verification。
+            # 如果仍失败，这是账号/手机号/SMS 状态问题，不是 Outlook 邮箱问题；
+            # 不能换邮箱重试，也不能把当前邮箱标坏。
+            log(f"账号手机二次验证无法完成，跳过本账号: {last_error}", "error")
             break
 
         if any(kw in last_error.lower() for kw in FATAL_EMAIL_KEYWORDS):
@@ -706,6 +744,7 @@ def _account_record(status: str, result: dict, bind_email: str, phase2_error: st
         "birthdate": result.get("birthdate", ""),
         "session_token": result.get("session_token", ""),
         "access_token": result.get("access_token", ""),
+        "activation_id": result.get("activation_id", ""),
         "sub2api_id": sub2api_id or result.get("sub2api_id", ""),
         "phase2_error": phase2_error,
         "saved_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
@@ -737,12 +776,14 @@ def worker(
     create_retries: int,
     cooldown: float,
     phase2_timeout: float,
+    reuse_phone: Optional[dict] = None,
+    worker_max_attempts: int = 0,
 ) -> None:
     cfg = copy.deepcopy(config)
     log = _make_worker_logger(wid, log_lock, router)
     local_success = 0
     local_attempts = 0
-    max_attempts = max(1, target_count * 15)
+    max_attempts = max(1, int(worker_max_attempts or target_count * 15))
     log(f"Worker 启动 (proxy={cfg.get('proxy') or '直连'})", "info")
 
     while local_success < target_count and state.should_continue(global_stop) and local_attempts < max_attempts:
@@ -763,24 +804,37 @@ def worker(
         cfg["bind_email"] = lease.email
         log(f"选中邮箱: {lease.email}", "info")
 
-        try:
-            with router.capture_current_thread(lambda line: log(line, "info")):
-                result = ar.register_one(
-                    cfg,
-                    verbose=True,
-                    step_retries=step_retries,
-                    create_account_max_retries=create_retries,
-                    max_price=cfg.get("max_price", ""),
-                    auto_activate=False,
-                )
-        except Exception as exc:
+        if reuse_phone:
             result = {
-                "ok": False,
-                "phone": "?",
-                "password": cfg.get("register", {}).get("password", ""),
-                "error": str(exc),
+                "ok": True,
+                "phone": reuse_phone["phone"],
+                "password": reuse_phone.get("password") or cfg.get("register", {}).get("password", ""),
+                "activation_id": reuse_phone["activation_id"],
+                "name": reuse_phone.get("name", ""),
+                "birthdate": reuse_phone.get("birthdate", ""),
+                "session_token": reuse_phone.get("session_token", ""),
+                "access_token": reuse_phone.get("access_token", ""),
             }
-            log(f"Phase 1 异常: {exc}", "error")
+            log(f"复用已注册号码: {result['phone']} 激活ID={result['activation_id']}", "info")
+        else:
+            try:
+                with router.capture_current_thread(lambda line: log(line, "info")):
+                    result = ar.register_one(
+                        cfg,
+                        verbose=True,
+                        step_retries=step_retries,
+                        create_account_max_retries=create_retries,
+                        max_price=cfg.get("max_price", ""),
+                        auto_activate=False,
+                    )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "phone": "?",
+                    "password": cfg.get("register", {}).get("password", ""),
+                    "error": str(exc),
+                }
+                log(f"Phase 1 异常: {exc}", "error")
 
         activation_id = result.get("activation_id", "") if isinstance(result, dict) else ""
         if not result or not result.get("ok"):
@@ -820,6 +874,7 @@ def worker(
                 log=log,
                 stop_event=global_stop,
                 total_timeout=phase2_timeout,
+                activation_id=activation_id,
             )
 
         active_lease = outcome.lease
@@ -865,7 +920,10 @@ def worker(
             final_email = outcome.final_email or (active_lease.email if active_lease else "")
             if active_lease and not active_lease.finalized:
                 active_lease.release(cooldown)
-            _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "Phase 2 失败", log, state)
+            if reuse_phone:
+                log("复用号码模式：Phase 2 失败不取消 activation，保留给下一次重试", "warn")
+            else:
+                _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "Phase 2 失败", log, state)
             result_writer.append_account(_account_record("fail_phase2", result, final_email, outcome.error))
             state.record_phase2_failed()
             log(f"Phase 2 失败: {outcome.error}", "error")
@@ -923,12 +981,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--max-price", type=str, default="", help="最高价格，覆盖 config.max_price")
     parser.add_argument("--cooldown", type=float, default=60.0, help="普通失败邮箱冷却秒数")
     parser.add_argument("--phase2-timeout", type=float, default=300.0, help="单次 Phase 2 总耗时上限秒数")
+    parser.add_argument("--max-attempts", type=int, default=0, help="全局最大尝试次数（0=默认 target*15）")
+    parser.add_argument("--reuse-phone", type=str, default="", help="复用已注册手机号，只跑 Phase 2，不再拿新号码")
+    parser.add_argument("--reuse-activation-id", type=str, default="", help="复用手机号对应的 SMS activation_id")
     args = parser.parse_args(argv)
 
     config = ar.load_config(args.config or None)
     config["_config_path"] = str(Path(args.config).resolve()) if args.config else str(ROOT / "config.json")
     if args.max_price:
         config["max_price"] = args.max_price
+    reuse_phone = None
+    if args.reuse_phone or args.reuse_activation_id:
+        if not (args.reuse_phone and args.reuse_activation_id):
+            print("[ERROR] --reuse-phone 和 --reuse-activation-id 必须同时提供")
+            return 2
+        reuse_phone = {
+            "phone": args.reuse_phone if args.reuse_phone.startswith("+") else f"+{args.reuse_phone}",
+            "activation_id": args.reuse_activation_id,
+            "password": config.get("register", {}).get("password", ""),
+        }
+        args.concurrency = 1
+        if args.max_attempts <= 0:
+            args.max_attempts = 1
 
     errors = _preflight(config, args.concurrency, args.count)
     if errors:
@@ -967,16 +1041,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"concurrency={args.concurrency} target_success={args.count} "
             f"邮箱可用 {stats['available']}/{stats['total']} used={stats['used']} error={stats['error']}"
         )
+        if reuse_phone:
+            main_log(
+                f"复用号码模式：phone={reuse_phone['phone']} activation_id={reuse_phone['activation_id']}，不会调用 getNumber"
+            )
 
         result_writer = ResultWriter()
-        state = RunState(args.count)
+        effective_max_attempts = args.max_attempts if args.max_attempts > 0 else args.count * 15
+        state = RunState(args.count, max_attempts=effective_max_attempts)
         workers = []
         effective_workers = min(args.concurrency, args.count)
         per_worker = args.count // effective_workers
         remainder = args.count % effective_workers
+        attempt_per_worker = max(0, effective_max_attempts) // effective_workers
+        attempt_remainder = max(0, effective_max_attempts) % effective_workers
         for idx in range(effective_workers):
             wid = idx + 1
             worker_target = per_worker + (1 if idx < remainder else 0)
+            worker_max_attempts = max(1, attempt_per_worker + (1 if idx < attempt_remainder else 0))
             thread = threading.Thread(
                 target=worker,
                 kwargs={
@@ -993,6 +1075,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "create_retries": args.create_retry,
                     "cooldown": args.cooldown,
                     "phase2_timeout": args.phase2_timeout,
+                    "reuse_phone": reuse_phone,
+                    "worker_max_attempts": worker_max_attempts,
                 },
                 name=f"worker-{wid}",
                 daemon=False,

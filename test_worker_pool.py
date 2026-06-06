@@ -339,6 +339,59 @@ class WorkerPoolComponentTests(unittest.TestCase):
         self.assertEqual(result["error"], "exchange-code: 400")
         self.assertEqual(len(exchange_calls), 1)
 
+    def test_run_second_half_msoutlook_fatal_precheck_does_not_send_bind_email(self):
+        class FakeFlow:
+            def __init__(self, *args, **kwargs):
+                self.send_called = False
+
+            @staticmethod
+            def parse_oauth_url(_url):
+                return {"client_id": "cid"}
+
+            def initiate_oauth(self, url):
+                return True, url, ""
+
+            def sentinel_authorize(self):
+                return None
+
+            def submit_phone(self, _phone):
+                return {"page": {"type": "login_password"}}
+
+            def sentinel_password(self):
+                return None
+
+            def verify_password(self, _password):
+                return {"page": {"type": "add_email"}}
+
+            def send_bind_email(self, _email):
+                raise AssertionError("send_bind_email should not run when msoutlook precheck is fatal")
+
+        old_flow = openai_bind_email.OAuthSecondHalf
+        old_history = openai_bind_email._get_email_history_codes
+        openai_bind_email.OAuthSecondHalf = FakeFlow
+        openai_bind_email._get_email_history_codes = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("msoutlook_unreadable: invalid_grant Account security interrupt")
+        )
+        try:
+            result = openai_bind_email.run_second_half(
+                oauth_url="https://oauth/?state=s",
+                phone="+100",
+                password="pw",
+                icloud_email="bad@example.com",
+                icloud_cookies={},
+                msoutlook_helper_url="http://helper",
+                msoutlook_email="bad@example.com",
+                verbose=False,
+                save_import=False,
+                interactive_input=False,
+            )
+        finally:
+            openai_bind_email.OAuthSecondHalf = old_flow
+            openai_bind_email._get_email_history_codes = old_history
+
+        self.assertFalse(result["ok"])
+        self.assertIn("msoutlook_unreadable", result["error"])
+
     def test_thread_stdout_router_routes_by_thread(self):
         router = worker_pool.ThreadStdoutRouter.install_once()
         logs = []
@@ -514,6 +567,73 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(records["old@example.com"]["status"], "error")
             self.assertEqual(records["old@example.com"]["phone"], "+1")
             self.assertEqual(records["old@example.com"]["password"], "pw")
+
+    def test_phase2_contact_verification_uses_phase1_sms_and_does_not_mark_email_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "first@example.com", "enabled": True, "used": False},
+                    {"email": "second@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            lease = allocator.acquire(1)
+            calls = {"run": 0, "sms": []}
+            old_get = worker_pool._get_oauth_session_with_retry
+            old_run = worker_pool.run_second_half
+            old_sms = worker_pool.PhoneSMS
+
+            class FakeSMS:
+                def __init__(self, provider, api_key):
+                    self.provider = provider
+                    self.api_key = api_key
+                    calls["sms"].append((provider, api_key))
+
+            def fake_run(**kwargs):
+                calls["run"] += 1
+                self.assertIs(kwargs["interactive_input"], False)
+                self.assertEqual(kwargs["phone_aid"], "aid1")
+                self.assertIsInstance(kwargs["sms_obj"], FakeSMS)
+                return {"ok": False, "error": "account_requires_contact_verification"}
+
+            worker_pool._get_oauth_session_with_retry = lambda sub, log: ("http://oauth/?state=s", "sid", "s")
+            worker_pool.run_second_half = fake_run
+            worker_pool.PhoneSMS = FakeSMS
+            try:
+                outcome = worker_pool._run_phase2_with_retry(
+                    wid=1,
+                    cfg={
+                        "sub2api": {"url": "u", "email": "e", "pwd": "p"},
+                        "icloud": {},
+                        "msoutlook": {"helper_url": ""},
+                        "sms_provider": "smsbower",
+                        "smsbower": {"api_key": "key1"},
+                    },
+                    phase1_result={"phone": "+1", "password": "pw", "activation_id": "aid1"},
+                    initial_lease=lease,
+                    allocator=allocator,
+                    log=lambda msg, tag="info": None,
+                    stop_event=threading.Event(),
+                )
+            finally:
+                worker_pool._get_oauth_session_with_retry = old_get
+                worker_pool.run_second_half = old_run
+                worker_pool.PhoneSMS = old_sms
+
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.final_email, "first@example.com")
+            self.assertEqual(calls["run"], 1)
+            self.assertEqual(calls["sms"], [("smsbower", "key1")])
+            records = json.loads(used_file.read_text(encoding="utf-8")).get("records", {})
+            self.assertEqual(records["first@example.com"]["status"], "used")
+            self.assertEqual(records["first@example.com"]["phone"], "reserved:W1")
+            self.assertEqual(records["first@example.com"].get("error", ""), "")
+            self.assertTrue(allocator.has_account("second@example.com"))
 
     def test_worker_phase2_failure_saves_fail_phase2_without_success(self):
         with tempfile.TemporaryDirectory() as tmp:
