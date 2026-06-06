@@ -576,6 +576,10 @@ def branch_contact_verification(reg, phone, activation_id):
     from phone_sms import PhoneSMS
 
     sms = PhoneSMS("hero-sms", HERO_SMS_API_KEY)
+    if hasattr(sms, "attach_activation"):
+        sms.attach_activation(activation_id)
+    else:
+        sms._activation_id = activation_id
 
     result = {"ok": False, "error": "not started"}
     fixed_about_you = False

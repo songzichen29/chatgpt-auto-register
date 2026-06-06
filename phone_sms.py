@@ -426,6 +426,15 @@ class PhoneSMS:
         )
         self._cancel_thread.start()
 
+    def attach_activation(self, activation_id: str, activated_at: Optional[float] = None) -> None:
+        """绑定一个外部已购买的 activation，后续 wait/resend/complete 使用它。
+
+        复用 HeroSMS/SmsBower 已购号码时不会经过本实例的 get_number()，
+        但仍需要让 wait_code()/resend()/complete() 能定位同一个订单。
+        """
+        self._activation_id = str(activation_id or "").strip() or None
+        self._activated_at = activated_at
+
     def get_number(
         self,
         service: str = "openai",
@@ -585,7 +594,8 @@ class PhoneSMS:
         """请求重新发送短信 (status=3)，复用该号码"""
         aid = activation_id or self._activation_id
         if aid and hasattr(self.client, "_call"):
-            self.client._call({"action": "setStatus", "id": aid, "status": "3"})
+            return self.client._call({"action": "setStatus", "id": aid, "status": "3"})
+        return ""
 
     # ---- SmsBower 兼容方法（无参，使用最近激活的 ID） ----
 

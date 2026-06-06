@@ -538,6 +538,10 @@ def _run_phase2_with_retry(
         if api_key:
             try:
                 sms_obj = PhoneSMS(provider, api_key)
+                if hasattr(sms_obj, "attach_activation"):
+                    sms_obj.attach_activation(phone_aid)
+                else:
+                    sms_obj._activation_id = phone_aid
             except Exception as exc:
                 log(f"Phase2 SMS 客户端初始化失败: {exc}", "warn")
         else:
@@ -777,6 +781,7 @@ def worker(
     cooldown: float,
     phase2_timeout: float,
     reuse_phone: Optional[dict] = None,
+    reuse_phone_phase: str = "phase2",
     worker_max_attempts: int = 0,
 ) -> None:
     cfg = copy.deepcopy(config)
@@ -804,7 +809,7 @@ def worker(
         cfg["bind_email"] = lease.email
         log(f"选中邮箱: {lease.email}", "info")
 
-        if reuse_phone:
+        if reuse_phone and reuse_phone_phase == "phase2":
             result = {
                 "ok": True,
                 "phone": reuse_phone["phone"],
@@ -819,6 +824,14 @@ def worker(
         else:
             try:
                 with router.capture_current_thread(lambda line: log(line, "info")):
+                    existing_phone = None
+                    if reuse_phone:
+                        existing_phone = {
+                            "phone": reuse_phone["phone"],
+                            "activation_id": reuse_phone["activation_id"],
+                            "password": reuse_phone.get("password") or cfg.get("register", {}).get("password", ""),
+                            "otp_code": reuse_phone.get("otp_code", ""),
+                        }
                     result = ar.register_one(
                         cfg,
                         verbose=True,
@@ -826,6 +839,7 @@ def worker(
                         create_account_max_retries=create_retries,
                         max_price=cfg.get("max_price", ""),
                         auto_activate=False,
+                        existing_phone=existing_phone,
                     )
             except Exception as exc:
                 result = {
@@ -843,7 +857,10 @@ def worker(
             failed_phone = result.get("phone", "?") if isinstance(result, dict) else "?"
             log(f"Phase 1 失败: {failed_phone} {phase1_error}", "error")
             if _has_real_phone(result):
-                _sms_cancel_async(cfg, activation_id, failed_phone, "Phase 1 失败", log, state)
+                if reuse_phone:
+                    log("复用号码模式：Phase 1 失败不取消 activation，保留给下一次处理", "warn")
+                else:
+                    _sms_cancel_async(cfg, activation_id, failed_phone, "Phase 1 失败", log, state)
                 result_writer.append_account(_account_record("fail_phase1", result, lease.email))
                 lease.release(cooldown)
             else:
@@ -984,6 +1001,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--max-attempts", type=int, default=0, help="全局最大尝试次数（0=默认 target*15）")
     parser.add_argument("--reuse-phone", type=str, default="", help="复用已注册手机号，只跑 Phase 2，不再拿新号码")
     parser.add_argument("--reuse-activation-id", type=str, default="", help="复用手机号对应的 SMS activation_id")
+    parser.add_argument(
+        "--reuse-phase",
+        choices=["phase1", "phase2"],
+        default="phase2",
+        help="复用号码入口：phase1=复用已购号码继续注册；phase2=复用已注册账号只跑 Phase 2（默认）",
+    )
+    parser.add_argument("--reuse-otp-code", type=str, default="", help="复用已购号码已有的短信验证码（phase1 时可用）")
     args = parser.parse_args(argv)
 
     config = ar.load_config(args.config or None)
@@ -999,6 +1023,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "phone": args.reuse_phone if args.reuse_phone.startswith("+") else f"+{args.reuse_phone}",
             "activation_id": args.reuse_activation_id,
             "password": config.get("register", {}).get("password", ""),
+            "otp_code": args.reuse_otp_code.strip(),
         }
         args.concurrency = 1
         if args.max_attempts <= 0:
@@ -1043,7 +1068,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         if reuse_phone:
             main_log(
-                f"复用号码模式：phone={reuse_phone['phone']} activation_id={reuse_phone['activation_id']}，不会调用 getNumber"
+                f"复用号码模式：phase={args.reuse_phase} phone={reuse_phone['phone']} "
+                f"activation_id={reuse_phone['activation_id']}，不会调用 getNumber"
             )
 
         result_writer = ResultWriter()
@@ -1076,6 +1102,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "cooldown": args.cooldown,
                     "phase2_timeout": args.phase2_timeout,
                     "reuse_phone": reuse_phone,
+                    "reuse_phone_phase": args.reuse_phase,
                     "worker_max_attempts": worker_max_attempts,
                 },
                 name=f"worker-{wid}",

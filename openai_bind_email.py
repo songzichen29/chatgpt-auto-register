@@ -697,6 +697,89 @@ def run_second_half(
     def log(msg):
         if verbose: _log(msg)
 
+    def _wait_contact_code_via_provider(timeout: int = 120, exclude_codes=None) -> str:
+        excluded = {str(c).strip() for c in (exclude_codes or []) if str(c).strip()}
+        if not (sms_obj and phone_aid):
+            return ""
+
+        def _call_provider(params: dict, per_timeout: float = 12.0) -> str:
+            client = getattr(sms_obj, "client", None)
+            if client is not None and hasattr(client, "_call"):
+                try:
+                    return str(client._call(params, timeout=per_timeout, retries=1) or "").strip()
+                except TypeError:
+                    return str(client._call(params) or "").strip()
+            return ""
+
+        def _get_status() -> str:
+            try:
+                status = _call_provider({"action": "getStatus", "id": phone_aid}, per_timeout=10.0)
+                if status:
+                    return status
+            except Exception:
+                pass
+            try:
+                return str(sms_obj.client.get_status(phone_aid, timeout=10, retries=1) or "").strip()
+            except Exception:
+                return ""
+
+        def _extract_code(status: str) -> str:
+            text = str(status or "").strip()
+            if text.startswith(("STATUS_OK:", "STATUS_WAIT_RETRY:")):
+                code = text.split(":", 1)[1].strip()
+                if code and code not in excluded:
+                    return code
+            return ""
+
+        deadline = time.time() + max(0, int(timeout))
+        list_actions = (
+            "getActiveActivations",
+            "getActiveActivationsV2",
+            "getActivations",
+            "getCurrentActivations",
+        )
+        while time.time() < deadline:
+            status = _get_status()
+            code = _extract_code(status)
+            if code:
+                return code
+            if status:
+                log(f"[5.5] SMS 状态: {status[:80]}")
+
+            # HeroSMS 页面/兼容接口有时会在列表 JSON 的 otpList 里带最新短信；
+            # getStatus 对已收过码的订单可能固定返回旧码，所以这里补一层读取。
+            for action in list_actions:
+                try:
+                    raw = _call_provider({"action": action}, per_timeout=12.0)
+                    if not raw or not raw.lstrip().startswith(("[", "{")):
+                        continue
+                    data = json.loads(raw)
+                    rows = data if isinstance(data, list) else (
+                        data.get("data") or data.get("items") or data.get("activations") or []
+                    )
+                    if not isinstance(rows, list):
+                        continue
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        if str(row.get("id") or row.get("activationId") or "") != str(phone_aid):
+                            continue
+                        otp_list = row.get("otpList") or []
+                        if not isinstance(otp_list, list):
+                            otp_list = []
+                        candidates = []
+                        for otp in otp_list:
+                            if isinstance(otp, dict):
+                                candidates.append(otp.get("smsCode") or otp.get("code") or "")
+                        candidates.append(row.get("smsCode") or "")
+                        for candidate in reversed([str(x).strip() for x in candidates if str(x).strip()]):
+                            if candidate and candidate not in excluded:
+                                return candidate
+                except Exception:
+                    continue
+            time.sleep(3)
+        return ""
+
     flow = OAuthSecondHalf(proxy=proxy, verbose=verbose)
 
     try:
@@ -877,30 +960,75 @@ def run_second_half(
                     "ok": False,
                     "error": "account_requires_contact_verification",
                 }
-            # 请求重发短信 OTP
-            r_send = flow.resend_contact_otp()
-            if r_send.get("error"):
-                log(f"[5.5] 重发失败: {r_send.get('error')}")
-                return {"ok": False, "error": f"resend_contact_otp: {r_send.get('error')}"}
-            log("[5.5] 已请求重发短信，等待验证码 ...")
-            # 从 SMS 平台收码
-            code_contact = str(bind_code or "").strip()
+            old_contact_codes = set()
             if sms_obj and phone_aid:
                 try:
-                    log("[5.5] 从 SMS 平台等待验证码 ...")
-                    code_contact = sms_obj.wait_for_code(phone_aid, timeout=120)
+                    get_status = getattr(getattr(sms_obj, "client", None), "get_status", None)
+                    if callable(get_status):
+                        current_sms_status = str(get_status(phone_aid, timeout=10, retries=1) or "")
+                        if current_sms_status.startswith(("STATUS_OK:", "STATUS_WAIT_RETRY:")):
+                            old_code = current_sms_status.split(":", 1)[1].strip()
+                            if old_code:
+                                old_contact_codes.add(old_code)
+                                log(f"[5.5] SMS 平台已有旧验证码，将忽略: {old_code}")
                 except Exception as e:
-                    log(f"[5.5] SMS 平台收码失败: {e}")
-            if not code_contact and interactive_input:
-                code_contact = input("  [?] 输入手机验证码 (6位): ").strip()
-            if not code_contact:
-                return {"ok": False, "error": "contact_verification code timeout"}
-            log(f"[5.5] 收到验证码: {code_contact}")
-            # 验证手机 OTP
-            r = flow.validate_contact_otp(code_contact)
-            if r.get("error"):
-                log(f"[5.5] 验证失败: {r.get('error')}")
-                return {"ok": False, "error": f"validate_contact_otp: {r.get('error')}"}
+                    log(f"[5.5] 查询 SMS 旧验证码失败，继续请求重发: {e}")
+                try:
+                    # hero-sms/SmsBower 需要先把订单置为“等待下一条短信”，否则
+                    # getStatus 会一直返回旧 STATUS_OK/STATUS_WAIT_RETRY 验证码。
+                    resend_result = str(sms_obj.resend(phone_aid) or "")
+                    if resend_result and "ACCESS_RETRY_GET" not in resend_result:
+                        log(f"[5.5] SMS 平台拒绝接收下一条短信: {resend_result[:120]}")
+                    else:
+                        log("[5.5] SMS 平台已请求接收下一条短信")
+                except Exception as e:
+                    log(f"[5.5] SMS 平台请求重发失败，继续尝试 OpenAI 重发: {e}")
+            code_contact = str(bind_code or "").strip()
+            contact_attempts = 2 if (sms_obj and phone_aid and not bind_code) else 1
+            r = {}
+            for contact_attempt in range(contact_attempts):
+                if contact_attempt > 0:
+                    old_contact_codes.add(str(code_contact or "").strip())
+                    code_contact = ""
+                    log(f"[5.5] 手机 OTP 重试 {contact_attempt + 1}/{contact_attempts} ...")
+                    try:
+                        resend_result = str(sms_obj.resend(phone_aid) or "")
+                        if resend_result and "ACCESS_RETRY_GET" not in resend_result:
+                            log(f"[5.5] SMS 平台拒绝接收下一条短信: {resend_result[:120]}")
+                        else:
+                            log("[5.5] SMS 平台已请求接收下一条短信")
+                    except Exception as e:
+                        log(f"[5.5] SMS 平台请求重发失败，继续尝试 OpenAI 重发: {e}")
+
+                # 请求重发短信 OTP
+                r_send = flow.resend_contact_otp()
+                if r_send.get("error"):
+                    log(f"[5.5] 重发失败: {r_send.get('error')}")
+                    return {"ok": False, "error": f"resend_contact_otp: {r_send.get('error')}"}
+                log("[5.5] 已请求重发短信，等待验证码 ...")
+                # 从 SMS 平台收码
+                if sms_obj and phone_aid and not bind_code:
+                    try:
+                        log("[5.5] 从 SMS 平台等待验证码 ...")
+                        code_contact = _wait_contact_code_via_provider(
+                            timeout=120,
+                            exclude_codes=list(old_contact_codes),
+                        )
+                    except Exception as e:
+                        log(f"[5.5] SMS 平台收码失败: {e}")
+                if not code_contact and interactive_input:
+                    code_contact = input("  [?] 输入手机验证码 (6位): ").strip()
+                if not code_contact:
+                    return {"ok": False, "error": "contact_verification code timeout"}
+                log(f"[5.5] 收到验证码: {code_contact}")
+                # 验证手机 OTP
+                r = flow.validate_contact_otp(code_contact)
+                if not r.get("error"):
+                    break
+                last_contact_error = str(r.get("error"))
+                log(f"[5.5] 验证失败: {last_contact_error}")
+                if "invalid_input" not in last_contact_error.lower() or contact_attempt >= contact_attempts - 1:
+                    return {"ok": False, "error": f"validate_contact_otp: {r.get('error')}"}
             page_type = (r.get("page") or {}).get("type", "")
             log(f"[5.5] 验证后 page: {page_type}")
             # 继续后面的流程

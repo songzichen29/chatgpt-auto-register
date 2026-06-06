@@ -214,6 +214,8 @@ def register_one(
 
     existing_phone: 可选，传入已有手机号信息 {"phone": "+xxx", "activation_id": "xxx", "password": "xxx"}。
         传入时跳过 get_number 步骤，复用该号码完成注册流程（Phase 2 邮箱碰撞时从 Phase 1 重跑）。
+        如果已有短信验证码，可额外传入 {"otp_code": "123456"}，首轮校验会直接使用该验证码，
+        不再要求 SMS 平台再次推送新短信。
     """
     service = config["service"]
     country = config["country"]
@@ -244,7 +246,10 @@ def register_one(
         if existing_phone:
             # 复用已有手机号（Phase 2 邮箱碰撞重跑 Phase 1）
             aid = existing_phone["activation_id"]
-            sms._activation_id = aid
+            if hasattr(sms, "attach_activation"):
+                sms.attach_activation(aid)
+            else:
+                sms._activation_id = aid
             phone = existing_phone["phone"]
             if verbose:
                 print(f"  复用手机号: {phone}  激活ID: {aid}  [平台:{sms_provider}]")
@@ -287,7 +292,11 @@ def register_one(
         if verbose:
             print(f"  验证码已发送到 {phone}")
 
-        code = sms.wait_code(timeout=config["code_timeout"])
+        code = str((existing_phone or {}).get("otp_code") or "").strip()
+        if code and verbose:
+            print(f"  使用已有验证码: {code}")
+        if not code:
+            code = sms.wait_code(timeout=config["code_timeout"])
         if not code:
             # 验证码超时：号码收不到验证码，重发也没用，加入延迟取消队列（≥150s 后 setStatus=8 退款）
             if auto_activate:
