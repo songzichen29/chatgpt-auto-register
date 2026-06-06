@@ -793,6 +793,72 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(outcome.final_email, "first@example.com")
             self.assertEqual(calls, {"run": 2, "fix": 1, "oauth": 2})
 
+    def test_phase2_missing_email_rate_limit_waits_like_phase1_script_then_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "first@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            lease = allocator.acquire(1)
+            calls = {"run": 0, "fix": 0, "sleep": []}
+            old_get = worker_pool._get_oauth_session_with_retry
+            old_run = worker_pool.run_second_half
+            old_fix = worker_pool._complete_about_you_via_chat_client
+            old_sleep = worker_pool.time.sleep
+
+            def fake_run(**kwargs):
+                calls["run"] += 1
+                if calls["run"] <= 2:
+                    return {"ok": False, "error": "codex_about_you_missing_email: contact_verification_about_you"}
+                return {
+                    "ok": True,
+                    "sub2api_account_id": "42",
+                    "import_data": {"accounts": [{"name": kwargs["icloud_email"]}]},
+                }
+
+            def fake_fix(**kwargs):
+                calls["fix"] += 1
+                if calls["fix"] == 1:
+                    return {"ok": False, "error": "ChatGPT client OAuth 发起失败: rate_limit_exceeded"}
+                return {"ok": True, "page": "add_email"}
+
+            worker_pool._get_oauth_session_with_retry = lambda sub, log: ("http://oauth/?state=s", "sid", "s")
+            worker_pool.run_second_half = fake_run
+            worker_pool._complete_about_you_via_chat_client = fake_fix
+            worker_pool.time.sleep = lambda seconds: calls["sleep"].append(seconds)
+            try:
+                outcome = worker_pool._run_phase2_with_retry(
+                    wid=1,
+                    cfg={
+                        "sub2api": {"url": "u", "email": "e", "pwd": "p"},
+                        "icloud": {},
+                        "msoutlook": {"helper_url": ""},
+                    },
+                    phase1_result={"phone": "+1", "password": "pw", "activation_id": ""},
+                    initial_lease=lease,
+                    allocator=allocator,
+                    log=lambda msg, tag="info": None,
+                    stop_event=threading.Event(),
+                    max_retries=3,
+                )
+            finally:
+                worker_pool._get_oauth_session_with_retry = old_get
+                worker_pool.run_second_half = old_run
+                worker_pool._complete_about_you_via_chat_client = old_fix
+                worker_pool.time.sleep = old_sleep
+
+            self.assertTrue(outcome.ok)
+            self.assertEqual(calls["run"], 3)
+            self.assertEqual(calls["fix"], 2)
+            self.assertEqual(calls["sleep"], [60])
+
     def test_worker_phase2_failure_saves_fail_phase2_without_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -829,7 +895,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
                     ok=False,
                     final_email=kwargs["initial_lease"].email,
                     lease=kwargs["initial_lease"],
-                    error="exchange-code: 500",
+                    error="fatal account state",
                 )
             worker_pool._run_phase2_with_retry = fake_phase2
             worker_pool._sms_action = lambda cfg, aid, action: True
@@ -864,6 +930,70 @@ class WorkerPoolComponentTests(unittest.TestCase):
             all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
             self.assertEqual(all_data[-1]["status"], "fail_phase2")
             self.assertEqual(all_data[-1]["password"], "pw")
+
+    def test_worker_phase2_retryable_rate_limit_does_not_cancel_activation(self):
+        self.assertTrue(worker_pool._is_retryable_phase2_error("rate_limit_exceeded"))
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "only@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            writer = worker_pool.ResultWriter(tmp_path / "results", tmp_path / "imports")
+            router = worker_pool.ThreadStdoutRouter.install_once()
+            state = worker_pool.RunState(target_success=1, max_attempts=1)
+            stop = threading.Event()
+            cancel_jobs = []
+
+            old_register_one = worker_pool.ar.register_one
+            old_phase2 = worker_pool._run_phase2_with_retry
+            old_cancel_async = worker_pool._sms_cancel_async
+            worker_pool.ar.register_one = lambda *args, **kwargs: {
+                "ok": True,
+                "phone": "+100",
+                "password": "pw",
+                "activation_id": "aid",
+            }
+            worker_pool._run_phase2_with_retry = lambda **kwargs: worker_pool.Phase2Outcome(
+                ok=False,
+                final_email=kwargs["initial_lease"].email,
+                lease=kwargs["initial_lease"],
+                error="codex_about_you_missing_email: contact_verification_about_you; ChatGPT about_you 修复失败: rate_limit_exceeded",
+            )
+            worker_pool._sms_cancel_async = lambda cfg, aid, phone, reason, log, state_obj: cancel_jobs.append((aid, phone, reason)) or state_obj.record_cancelled()
+            try:
+                worker_pool.worker(
+                    wid=1,
+                    config={"sub2api": {"url": "u", "email": "e", "pwd": "p"}, "msoutlook": {"helper_url": ""}},
+                    target_count=1,
+                    global_stop=stop,
+                    allocator=allocator,
+                    result_writer=writer,
+                    router=router,
+                    log_lock=threading.Lock(),
+                    state=state,
+                    step_retries=0,
+                    create_retries=1,
+                    cooldown=60,
+                    phase2_timeout=1,
+                    worker_max_attempts=1,
+                )
+            finally:
+                worker_pool.ar.register_one = old_register_one
+                worker_pool._run_phase2_with_retry = old_phase2
+                worker_pool._sms_cancel_async = old_cancel_async
+                router.restore()
+
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["phase2_failed"], 1)
+            self.assertEqual(snapshot["cancelled"], 0)
+            self.assertEqual(cancel_jobs, [])
 
     def test_worker_phase1_failure_queues_cancel_without_blocking_sms_action(self):
         with tempfile.TemporaryDirectory() as tmp:

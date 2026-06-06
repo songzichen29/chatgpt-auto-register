@@ -422,12 +422,26 @@ def branch_new_account(reg, phone, activation_id):
     result = _retry_call(lambda c=code: reg.validate_otp(c), label="校验验证码")
     continue_url = result.get("continue_url", "")
     if not continue_url:
+        detail = result.get("_error") or result.get("_body") or ""
+        status_code = result.get("_status")
+        detail_lc = str(detail).lower()
+        session_invalid = (
+            int(status_code or 0) == 409
+            and (
+                "session is no longer valid" in detail_lc
+                or "start over" in detail_lc
+                or "invalid authorization step" in detail_lc
+            )
+        )
+        if session_invalid:
+            print(f"  → OTP 校验后会话失效(status=409)，账号可能已进入半注册/已注册状态，走已有账号 Phase 2 流程")
+            return branch_contact_verification(reg, phone, activation_id)
         return {
             "ok": False,
             "phone": phone,
             "password": PASSWORD,
             "activation_id": activation_id,
-            "error": f"验证码校验失败(status={result.get('_status')}): {(result.get('_error') or result.get('_body') or '')[:160]}",
+            "error": f"验证码校验失败(status={status_code}): {str(detail)[:160]}",
         }
     print(f"  OTP 验证成功!")
     print(f"  continue_url: {continue_url[:100]}...")

@@ -37,6 +37,8 @@ RETRYABLE_PHASE2_KEYWORDS = (
     "timeout",
     "proxy",
     "eof",
+    "rate_limit_exceeded",
+    "too many requests",
     "429",
     "500",
     "502",
@@ -449,6 +451,19 @@ def _is_retryable_phase2_error(error: str) -> bool:
     return any(keyword in err for keyword in RETRYABLE_PHASE2_KEYWORDS)
 
 
+def _phase2_retry_wait_seconds(error: str, attempt_index: int) -> int:
+    """Phase2 重试等待时间。
+
+    attempt_index 是 0 基索引。rate_limit_exceeded/429 不能按普通网络抖动
+    只等几秒，否则线上会连续撞同一个 auth 限流窗口；这里和
+    run_phase1_for_phone.py 的 Phase2 等待策略保持一致。
+    """
+    text = str(error or "").lower()
+    if "rate_limit_exceeded" in text or "too many requests" in text or "429" in text:
+        return 60 * (int(attempt_index) + 1)
+    return 5
+
+
 def _post_json_with_retry(
     url: str,
     *,
@@ -734,8 +749,9 @@ def _run_phase2_with_retry(
                 if stop_event.is_set():
                     break
                 if retry_count < max_retries and time.time() - start <= total_timeout:
-                    log(f"missing_email 修复遇到可重试错误: {last_error}", "warn")
-                    time.sleep(10)
+                    wait_sec = _phase2_retry_wait_seconds(last_error, retry_count - 1)
+                    log(f"missing_email 修复遇到可重试错误，{wait_sec}s 后重试: {last_error}", "warn")
+                    time.sleep(wait_sec)
                     continue
 
         if "email_already_in_use" in last_error:
@@ -792,8 +808,9 @@ def _run_phase2_with_retry(
             if stop_event.is_set():
                 break
             if retry_count < max_retries and time.time() - start <= total_timeout:
-                log(f"Phase2 可重试错误: {last_error}", "warn")
-                time.sleep(5)
+                wait_sec = _phase2_retry_wait_seconds(last_error, retry_count - 1)
+                log(f"Phase2 可重试错误，{wait_sec}s 后重试: {last_error}", "warn")
+                time.sleep(wait_sec)
                 continue
 
         break
@@ -1070,6 +1087,8 @@ def worker(
                 active_lease.release(cooldown)
             if reuse_phone:
                 log("复用号码模式：Phase 2 失败不取消 activation，保留给下一次重试", "warn")
+            elif _is_retryable_phase2_error(outcome.error):
+                log("Phase 2 可重试错误，不取消 activation，保留给下一次重试", "warn")
             else:
                 _sms_cancel_async(cfg, activation_id, result.get("phone", "?"), "Phase 2 失败", log, state)
             result_writer.append_account(_account_record("fail_phase2", result, final_email, outcome.error))
