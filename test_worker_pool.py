@@ -56,6 +56,13 @@ class WorkerPoolComponentTests(unittest.TestCase):
         self.assertTrue(auto_register._is_auth_session_invalid_error({"error": {"code": "invalid_state"}}))
         self.assertFalse(auto_register._is_auth_session_invalid_error("name is invalid"))
 
+    def test_otp_rebuild_409_session_invalid_is_existing_account_signal(self):
+        err = (
+            "OTP 会话重建失败: 注册被拒(status=409): "
+            "{\"error\":{\"message\":\"Your sign-in session is no longer valid. Please start over.\"}}"
+        )
+        self.assertTrue(auto_register._looks_existing_or_auth_step_error(err))
+
     def test_auth_json_fallback_retries_transport_error_with_http1_rebuild(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
         calls = {"post": 0, "rebuild": 0, "sentinel": []}

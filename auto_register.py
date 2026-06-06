@@ -202,6 +202,9 @@ def _looks_existing_or_auth_step_error(error: object) -> bool:
             "invalid_auth_step",
             "phone number already in use",
             "phone_number_in_use",
+            "注册被拒(status=409)",
+            "session is no longer valid",
+            "start over",
         )
     )
 
