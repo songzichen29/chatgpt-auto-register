@@ -12,8 +12,9 @@ import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from chatgpt_register import ChatGPTRegister
 from msoutlook_pool import MsOutlookPool, load_used_set, DEFAULT_USED_FILE
-from openai_bind_email import run_second_half
+from openai_bind_email import AUTH, JSON_HEADERS, OAuthSecondHalf, run_second_half
 import requests
 
 # ── 配置 ──
@@ -46,6 +47,7 @@ SUB2API_PWD = _SUB2API.get("pwd") or _PHASE2.get("sub2api_password") or ""
 MSOUTLOOK_HELPER = _nested(_CONFIG, "msoutlook", "helper_url") or _PHASE2.get("msoutlook_helper_url") or "http://127.0.0.1:17373"
 MAX_EMAIL_RETRIES = 10
 MAX_OAUTH_RETRIES = 3  # exchange-code 失败后重跑 OAuth 的次数
+CREATE_ACCOUNT_RETRIES = int(_REGISTER.get("create_account_max_retries") or _CONFIG.get("create_account_max_retries") or 20)
 FATAL_EMAIL_KEYWORDS = (
     "msoutlook_unreadable",
     "compromised",
@@ -60,7 +62,7 @@ FATAL_EMAIL_KEYWORDS = (
 STATUS_FILE = Path("batch_phase2_status.json")
 
 # 已注册的手机号列表
-ALL_PHONES = ['+56989679165', '+56987085391']  # 替换为实际手机号列表
+ALL_PHONES = ['+447927101702']  # 替换为实际手机号列表
 
 # 加载已上传的号码（跳过）
 def load_uploaded():
@@ -93,10 +95,112 @@ def get_oauth_url():
     return oauth_url, session_id, oauth_state
 
 
+def _account_profile_for_attempt(attempt: int) -> tuple[str, str]:
+    """生成 about_you/create_account 资料，避免使用占位 A/2000-01-01。"""
+    configured_name = str(_REGISTER.get("name") or "").strip()
+    configured_birthdate = str(_REGISTER.get("birthdate") or "").strip()
+    if (
+        attempt == 0
+        and configured_name
+        and configured_birthdate
+        and configured_name != "A"
+        and configured_birthdate != "2000-01-01"
+    ):
+        return configured_name, configured_birthdate
+
+    from auto_register import random_birthdate, random_name
+
+    return random_name(), random_birthdate()
+
+
+def complete_about_you_via_chat_client(phone: str, password: str) -> dict:
+    """batch_phase2 遇到 Codex OAuth missing_email 时，用 ChatGPT client 先补 about_you。
+
+    现象：
+      Codex OAuth: about_you -> create_account 返回 missing_email
+      ChatGPT client: 同一账号可先补 about_you，然后重新跑 Codex OAuth 继续绑邮箱
+    """
+    print("  [修复] 使用 ChatGPT client 补 about_you ...")
+    reg = ChatGPTRegister(proxy=PROXY, verbose=True)
+    reg.visit()
+    csrf = reg.get_csrf()
+    redirect = reg.signin(phone, csrf)
+    if not redirect:
+        return {"ok": False, "error": "ChatGPT client signin 无返回"}
+
+    flow = OAuthSecondHalf(proxy=PROXY, verbose=True)
+    ok, current_url, _html = flow.initiate_oauth(redirect)
+    if not ok:
+        return {"ok": False, "error": f"ChatGPT client OAuth 发起失败: {current_url[:120]}"}
+
+    flow.sentinel_authorize()
+    r = flow.submit_phone(phone)
+    if r.get("error"):
+        return {"ok": False, "error": f"ChatGPT client submit_phone: {r.get('error')}"}
+
+    flow.sentinel_password()
+    r = flow.verify_password(password)
+    if r.get("error"):
+        return {"ok": False, "error": f"ChatGPT client verify_password: {r.get('error')}"}
+
+    page_type = (r.get("page") or {}).get("type", "")
+    if "about_you" not in page_type:
+        print(f"  [修复] ChatGPT client 当前 page={page_type or '?'}，无需补 about_you")
+        return {"ok": True, "page": page_type, "skipped": True}
+
+    last_error = ""
+    for ca_attempt in range(max(1, CREATE_ACCOUNT_RETRIES)):
+        ca_name, ca_birthdate = _account_profile_for_attempt(ca_attempt)
+        print(
+            f"  [修复] create_account [{ca_attempt + 1}/{CREATE_ACCOUNT_RETRIES}]: "
+            f"name={ca_name} birthdate={ca_birthdate}"
+        )
+        headers = {
+            **JSON_HEADERS,
+            "referer": f"{AUTH}/about-you",
+            "oai-device-id": flow.device_id,
+        }
+        st = flow._sentinel_token("oauth_create_account")
+        if st:
+            headers["OpenAI-Sentinel-Token"] = st
+        resp = flow.session.post(
+            f"{AUTH}/api/accounts/create_account",
+            json={"name": ca_name, "birthdate": ca_birthdate},
+            headers=headers,
+            allow_redirects=False,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        next_page = (data.get("page") or {}).get("type", "")
+        continue_url = data.get("continue_url", "")
+        err = data.get("error") or {}
+        err_code = err.get("code", "") if isinstance(err, dict) else ""
+        last_error = resp.text[:300] if resp.text else f"status={resp.status_code}, page={next_page or '?'}"
+        print(f"  [修复] create_account status={resp.status_code} page={next_page or '?'} code={err_code or '-'}")
+        if resp.ok and continue_url:
+            return {
+                "ok": True,
+                "page": next_page,
+                "continue_url": continue_url,
+                "name": ca_name,
+                "birthdate": ca_birthdate,
+            }
+        if ca_attempt < CREATE_ACCOUNT_RETRIES - 1:
+            time.sleep(20 if err_code == "rate_limit_exceeded" or resp.status_code == 429 else 1)
+
+    return {
+        "ok": False,
+        "error": f"ChatGPT client create_account 失败(已重试{CREATE_ACCOUNT_RETRIES}次): {last_error}",
+    }
+
+
 def run_phase2_for_phone(phone, pool):
     """对一个手机号跑 Phase 2，循环换邮箱直到成功或耗尽"""
     email_retry = 0
     current_email = pool.get_available_email()
+    fixed_about_you = False
 
     if not current_email:
         print(f"  [ERROR] 号池无可用邮箱")
@@ -165,6 +269,32 @@ def run_phase2_for_phone(phone, pool):
                         # exchange-code 失败，auth code 可能已过期，重跑 OAuth
                         print(f"  [WARN] exchange-code 失败，重跑 OAuth...")
                         continue
+                    elif "codex_about_you_missing_email" in err and not fixed_about_you:
+                        # Codex OAuth 在半注册账号上可能 about_you/create_account 返回 missing_email。
+                        # 先用 ChatGPT 原始 client 补 about_you，再重新获取 Codex OAuth URL 继续 Phase 2。
+                        fix = complete_about_you_via_chat_client(phone, PASSWORD)
+                        if fix.get("ok"):
+                            fixed_about_you = True
+                            print(f"  [修复] about_you 已补完，重新跑 Codex Phase2 ...")
+                            continue
+                        fix_err = fix.get("error", "unknown")
+                        print(f"  [ERROR] ChatGPT about_you 修复失败: {fix_err[:200]}")
+                        return {
+                            "ok": False,
+                            "phone": phone,
+                            "password": PASSWORD,
+                            "bind_email": current_email,
+                            "error": f"{err}; ChatGPT about_you 修复失败: {fix_err}",
+                        }
+                    elif "codex_about_you_missing_email" in err:
+                        print(f"  [ERROR] about_you missing_email 已修复过一次仍失败，不再重复修复")
+                        return {
+                            "ok": False,
+                            "phone": phone,
+                            "password": PASSWORD,
+                            "bind_email": current_email,
+                            "error": err or "codex_about_you_missing_email",
+                        }
                     elif "account_stuck_email_otp" in err:
                         # 账号状态问题，不证明当前选中的 Outlook 邮箱不可用。
                         print(f"  [ERROR] 账号卡在 email_otp 状态，当前邮箱不标记为坏邮箱")

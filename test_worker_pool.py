@@ -339,6 +339,88 @@ class WorkerPoolComponentTests(unittest.TestCase):
         self.assertEqual(result["error"], "exchange-code: 400")
         self.assertEqual(len(exchange_calls), 1)
 
+    def test_run_second_half_about_you_create_account_sends_bind_email(self):
+        captured_payloads = []
+
+        class FakeCreateResponse:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = '{"page":{"type":"email_otp_verification"}}'
+
+            def json(self):
+                return {
+                    "page": {"type": "email_otp_verification"},
+                    "continue_url": "/email-verification",
+                }
+
+        class FakeSession:
+            def post(self, url, **kwargs):
+                if url.endswith("/api/accounts/create_account"):
+                    captured_payloads.append(kwargs.get("json"))
+                    return FakeCreateResponse()
+                raise AssertionError(f"unexpected post: {url}")
+
+        class FakeFlow:
+            def __init__(self, *args, **kwargs):
+                self.session = FakeSession()
+                self.device_id = "device-id"
+
+            @staticmethod
+            def parse_oauth_url(_url):
+                return {"client_id": "cid"}
+
+            def initiate_oauth(self, url):
+                return True, url, ""
+
+            def sentinel_authorize(self):
+                return None
+
+            def submit_phone(self, _phone):
+                return {"page": {"type": "login_password"}}
+
+            def sentinel_password(self):
+                return None
+
+            def verify_password(self, _password):
+                return {"page": {"type": "about_you"}}
+
+            def _sentinel_token(self, _flow):
+                return "sentinel-token"
+
+            def verify_email_otp(self, _code):
+                return {"page": {"type": "consent"}, "continue_url": "/consent"}
+
+            def follow_continue_until_code(self, _continue_url):
+                return "auth-code"
+
+            def final_oauth(self, _params):
+                return "auth-code"
+
+        old_flow = openai_bind_email.OAuthSecondHalf
+        old_poll = openai_bind_email._poll_bind_code
+        openai_bind_email.OAuthSecondHalf = FakeFlow
+        openai_bind_email._poll_bind_code = lambda *args, **kwargs: "123456"
+        try:
+            result = openai_bind_email.run_second_half(
+                oauth_url="https://oauth/?state=s",
+                phone="+100",
+                password="pw",
+                icloud_email="bound@example.com",
+                icloud_cookies={},
+                msoutlook_email="bound@example.com",
+                verbose=False,
+                save_import=False,
+                interactive_input=False,
+            )
+        finally:
+            openai_bind_email.OAuthSecondHalf = old_flow
+            openai_bind_email._poll_bind_code = old_poll
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured_payloads[0]["email"], "bound@example.com")
+        self.assertEqual(captured_payloads[0]["name"], "A")
+        self.assertEqual(captured_payloads[0]["birthdate"], "2000-01-01")
+
     def test_run_second_half_msoutlook_fatal_precheck_does_not_send_bind_email(self):
         class FakeFlow:
             def __init__(self, *args, **kwargs):
