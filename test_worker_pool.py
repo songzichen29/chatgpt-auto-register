@@ -81,7 +81,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
 
         reg.session = FakeSession()
         reg._add_sentinel_headers = fake_sentinel
-        reg._rebuild_session = lambda: calls.__setitem__("rebuild", calls["rebuild"] + 1)
+        reg._rebuild_session = lambda **_kwargs: calls.__setitem__("rebuild", calls["rebuild"] + 1)
 
         result = reg._post_auth_json_with_fallback(
             "/api/test",
@@ -634,6 +634,75 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(records["first@example.com"]["phone"], "reserved:W1")
             self.assertEqual(records["first@example.com"].get("error", ""), "")
             self.assertTrue(allocator.has_account("second@example.com"))
+
+    def test_phase2_missing_email_runs_chat_client_fix_and_retries_codex_oauth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "first@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            lease = allocator.acquire(1)
+            calls = {"run": 0, "fix": 0, "oauth": 0}
+            old_get = worker_pool._get_oauth_session_with_retry
+            old_run = worker_pool.run_second_half
+            old_fix = worker_pool._complete_about_you_via_chat_client
+
+            def fake_get(sub, log):
+                calls["oauth"] += 1
+                return ("http://oauth/?state=s", "sid", "s")
+
+            def fake_run(**kwargs):
+                calls["run"] += 1
+                self.assertEqual(kwargs["phone"], "+1")
+                self.assertEqual(kwargs["password"], "pw")
+                if calls["run"] == 1:
+                    return {"ok": False, "error": "codex_about_you_missing_email: contact_verification_about_you"}
+                return {
+                    "ok": True,
+                    "sub2api_account_id": "42",
+                    "import_data": {"accounts": [{"name": kwargs["icloud_email"]}]},
+                }
+
+            def fake_fix(**kwargs):
+                calls["fix"] += 1
+                self.assertEqual(kwargs["phone"], "+1")
+                self.assertEqual(kwargs["password"], "pw")
+                self.assertEqual(kwargs["create_retries"], 7)
+                return {"ok": True, "page": "add_email"}
+
+            worker_pool._get_oauth_session_with_retry = fake_get
+            worker_pool.run_second_half = fake_run
+            worker_pool._complete_about_you_via_chat_client = fake_fix
+            try:
+                outcome = worker_pool._run_phase2_with_retry(
+                    wid=1,
+                    cfg={
+                        "sub2api": {"url": "u", "email": "e", "pwd": "p"},
+                        "icloud": {},
+                        "msoutlook": {"helper_url": ""},
+                        "_create_retries": 7,
+                    },
+                    phase1_result={"phone": "+1", "password": "pw", "activation_id": ""},
+                    initial_lease=lease,
+                    allocator=allocator,
+                    log=lambda msg, tag="info": None,
+                    stop_event=threading.Event(),
+                )
+            finally:
+                worker_pool._get_oauth_session_with_retry = old_get
+                worker_pool.run_second_half = old_run
+                worker_pool._complete_about_you_via_chat_client = old_fix
+
+            self.assertTrue(outcome.ok)
+            self.assertEqual(outcome.final_email, "first@example.com")
+            self.assertEqual(calls, {"run": 2, "fix": 1, "oauth": 2})
 
     def test_worker_phase2_failure_saves_fail_phase2_without_success(self):
         with tempfile.TemporaryDirectory() as tmp:

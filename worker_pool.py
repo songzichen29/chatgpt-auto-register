@@ -23,8 +23,9 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 import auto_register as ar
+from chatgpt_register import ChatGPTRegister
 from msoutlook_pool import DEFAULT_POOL_PATH, DEFAULT_USED_FILE, MsOutlookPool, load_used_set
-from openai_bind_email import run_second_half
+from openai_bind_email import AUTH, JSON_HEADERS, OAuthSecondHalf, run_second_half
 from phone_sms import PhoneSMS
 
 
@@ -512,6 +513,113 @@ def _get_oauth_session_with_retry(sub: dict, log: Callable[[str, str], None]) ->
     return oauth_url, session_id, state
 
 
+def _account_profile_for_attempt(cfg: dict, attempt: int) -> tuple[str, str]:
+    reg_cfg = cfg.get("register", {}) or {}
+    name = str(reg_cfg.get("name") or "").strip()
+    birthdate = str(reg_cfg.get("birthdate") or "").strip()
+    if attempt == 0 and name and birthdate and not (name == "A" and birthdate == "2000-01-01"):
+        return name, birthdate
+    return ar.random_name(), ar.random_birthdate()
+
+
+def _complete_about_you_via_chat_client(
+    *,
+    cfg: dict,
+    phone: str,
+    password: str,
+    log: Callable[[str, str], None],
+    create_retries: int,
+) -> dict:
+    """补齐 Codex OAuth 中缺失的 about_you 状态。
+
+    部分手机号在 Phase 1 OTP 成功后会变成“半注册”状态：
+    Codex OAuth 里提交 about_you 会返回 missing_email，但 ChatGPT 原始 client
+    可以先把 about_you 补完。补完后再重新跑 Codex OAuth 才能继续绑邮箱。
+    """
+    proxy = cfg.get("proxy", "")
+    log("missing_email 修复：使用 ChatGPT client 补 about_you", "warn")
+
+    reg = ChatGPTRegister(proxy=proxy, verbose=True)
+    reg.visit()
+    csrf = reg.get_csrf()
+    redirect = reg.signin(phone, csrf)
+    if not redirect:
+        return {"ok": False, "error": "ChatGPT client signin 无返回"}
+
+    flow = OAuthSecondHalf(proxy=proxy, verbose=True)
+    ok, current_url, _html = flow.initiate_oauth(redirect)
+    if not ok:
+        return {"ok": False, "error": f"ChatGPT client OAuth 发起失败: {current_url[:120]}"}
+
+    flow.sentinel_authorize()
+    r = flow.submit_phone(phone)
+    if r.get("error"):
+        return {"ok": False, "error": f"ChatGPT client submit_phone: {r.get('error')}"}
+
+    flow.sentinel_password()
+    r = flow.verify_password(password)
+    if r.get("error"):
+        return {"ok": False, "error": f"ChatGPT client verify_password: {r.get('error')}"}
+
+    page_type = (r.get("page") or {}).get("type", "")
+    if "about_you" not in page_type:
+        log(f"missing_email 修复：ChatGPT client 当前 page={page_type or '?'}，无需补 about_you", "info")
+        return {"ok": True, "page": page_type, "skipped": True}
+
+    last_error = ""
+    max_create_retries = max(1, int(create_retries or 1))
+    for ca_attempt in range(max_create_retries):
+        ca_name, ca_birthdate = _account_profile_for_attempt(cfg, ca_attempt)
+        log(
+            f"missing_email 修复：create_account [{ca_attempt + 1}/{max_create_retries}] "
+            f"name={ca_name} birthdate={ca_birthdate}",
+            "info",
+        )
+        headers = {
+            **JSON_HEADERS,
+            "referer": f"{AUTH}/about-you",
+            "oai-device-id": flow.device_id,
+        }
+        st = flow._sentinel_token("oauth_create_account")
+        if st:
+            headers["OpenAI-Sentinel-Token"] = st
+        resp = flow.session.post(
+            f"{AUTH}/api/accounts/create_account",
+            json={"name": ca_name, "birthdate": ca_birthdate},
+            headers=headers,
+            allow_redirects=False,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        next_page = (data.get("page") or {}).get("type", "")
+        continue_url = data.get("continue_url", "")
+        err = data.get("error") or {}
+        err_code = err.get("code", "") if isinstance(err, dict) else ""
+        last_error = resp.text[:300] if resp.text else f"status={resp.status_code}, page={next_page or '?'}"
+        log(
+            f"missing_email 修复：create_account status={resp.status_code} "
+            f"page={next_page or '?'} code={err_code or '-'}",
+            "info",
+        )
+        if resp.ok and continue_url:
+            return {
+                "ok": True,
+                "page": next_page,
+                "continue_url": continue_url,
+                "name": ca_name,
+                "birthdate": ca_birthdate,
+            }
+        if ca_attempt < max_create_retries - 1:
+            time.sleep(20 if err_code == "rate_limit_exceeded" or resp.status_code == 429 else 1)
+
+    return {
+        "ok": False,
+        "error": f"ChatGPT client create_account 失败(已重试{max_create_retries}次): {last_error}",
+    }
+
+
 def _run_phase2_with_retry(
     *,
     wid: int,
@@ -549,6 +657,7 @@ def _run_phase2_with_retry(
     start = time.time()
     retry_count = 0
     last_error = ""
+    fixed_about_you = False
 
     while retry_count < max_retries and time.time() - start <= total_timeout:
         retry_count += 1
@@ -608,6 +717,27 @@ def _run_phase2_with_retry(
             )
 
         last_error = oauth_result.get("error", "") or "Phase 2 failed"
+        if "codex_about_you_missing_email" in last_error and not fixed_about_you:
+            fix = _complete_about_you_via_chat_client(
+                cfg=cfg,
+                phone=phase1_result["phone"],
+                password=phase1_result["password"],
+                log=log,
+                create_retries=int(cfg.get("_create_retries", 20) or 20),
+            )
+            if fix.get("ok"):
+                fixed_about_you = True
+                log("missing_email 修复完成，重新获取 Codex OAuth URL 后继续 Phase2", "warn")
+                continue
+            last_error = f"{last_error}; ChatGPT about_you 修复失败: {fix.get('error', 'unknown')}"
+            if _is_retryable_phase2_error(last_error):
+                if stop_event.is_set():
+                    break
+                if retry_count < max_retries and time.time() - start <= total_timeout:
+                    log(f"missing_email 修复遇到可重试错误: {last_error}", "warn")
+                    time.sleep(10)
+                    continue
+
         if "email_already_in_use" in last_error:
             log(f"邮箱已被占用: {current_email}", "warn")
             active_lease.mark_error(
@@ -785,6 +915,7 @@ def worker(
     worker_max_attempts: int = 0,
 ) -> None:
     cfg = copy.deepcopy(config)
+    cfg["_create_retries"] = create_retries
     log = _make_worker_logger(wid, log_lock, router)
     local_success = 0
     local_attempts = 0
