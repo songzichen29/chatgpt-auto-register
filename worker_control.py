@@ -293,6 +293,9 @@ class WorkerProcessController:
         cooldown = parse_float(params.get("cooldown"), 60.0, min_value=0.0)
         phase2_timeout = parse_float(params.get("phase2_timeout"), 300.0, min_value=1.0)
         max_attempts = parse_int(params.get("max_attempts"), 0, min_value=0)
+        attempts_per_target = parse_int(params.get("attempts_per_target"), 0, min_value=0)
+        if attempts_per_target:
+            max_attempts = count * attempts_per_target
         config_path = str(params.get("config") or (self.root / "config.json"))
         cmd = [
             sys.executable, str(self.root / "worker_pool.py"),
@@ -1284,6 +1287,9 @@ class RetryController:
             count = min(len(items), max_items)
             start_options = dict(options)
             start_options["count"] = count
+            attempts_per_target = parse_int(start_options.get("attempts_per_target"), 0, min_value=0)
+            if attempts_per_target:
+                start_options["max_attempts"] = count * attempts_per_target
             start_options.setdefault("max_attempts", count)
             ok, data = self.worker_controller.start(start_options)
             if not ok:
