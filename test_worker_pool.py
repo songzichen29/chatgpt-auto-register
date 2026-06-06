@@ -339,7 +339,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
         self.assertEqual(result["error"], "exchange-code: 400")
         self.assertEqual(len(exchange_calls), 1)
 
-    def test_run_second_half_about_you_create_account_sends_bind_email(self):
+    def test_run_second_half_about_you_create_account_does_not_send_email_param(self):
         captured_payloads = []
 
         class FakeCreateResponse:
@@ -417,7 +417,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             openai_bind_email._poll_bind_code = old_poll
 
         self.assertTrue(result["ok"])
-        self.assertEqual(captured_payloads[0]["email"], "bound@example.com")
+        self.assertNotIn("email", captured_payloads[0])
         self.assertEqual(captured_payloads[0]["name"], "A")
         self.assertEqual(captured_payloads[0]["birthdate"], "2000-01-01")
 

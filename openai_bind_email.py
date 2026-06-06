@@ -850,14 +850,10 @@ def run_second_half(
             if st:
                 h["OpenAI-Sentinel-Token"] = st
             log(f"[5] create_account headers: oai-device-id={flow.device_id[:20]}..., sentinel={'yes' if st else 'no'}")
+            # 真实端点 /api/accounts/create_account 只接受 name/birthdate。
+            # missing_email 是服务端当前 OAuth session 状态缺 email，不是该接口可传 email；
+            # 如果在这里传 email，会返回 unknown_parameter。
             create_payload = {"name": "A", "birthdate": "2000-01-01"}
-            bind_email = (msoutlook_email or icloud_email or "").strip()
-            if bind_email:
-                # 某些半注册账号在 Codex OAuth 的 about_you 阶段会要求先具备 email。
-                # 既然 Phase2 调用方已经分配了待绑定邮箱，就不要先撞 missing_email
-                # 再绕 ChatGPT client fallback；直接在 create_account 里携带 email。
-                create_payload["email"] = bind_email
-            log(f"[5] create_account payload fields: {','.join(create_payload.keys())}")
             resp = flow.session.post(
                 f"{AUTH}/api/accounts/create_account",
                 json=create_payload,
