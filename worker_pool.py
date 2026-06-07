@@ -653,22 +653,6 @@ def _run_phase2_with_retry(
     sub_email = sub.get("email") or ""
     sub_pwd = sub.get("pwd") or ""
     active_lease: Optional[EmailLease] = initial_lease
-    phone_aid = str(activation_id or phase1_result.get("activation_id") or "").strip()
-    sms_obj = None
-    if phone_aid:
-        provider = cfg.get("sms_provider", "smsbower")
-        api_key = ar._get_sms_api_key(cfg, provider)
-        if api_key:
-            try:
-                sms_obj = PhoneSMS(provider, api_key)
-                if hasattr(sms_obj, "attach_activation"):
-                    sms_obj.attach_activation(phone_aid)
-                else:
-                    sms_obj._activation_id = phone_aid
-            except Exception as exc:
-                log(f"Phase2 SMS 客户端初始化失败: {exc}", "warn")
-        else:
-            log("Phase2 有 activation_id 但缺少 SMS API key，无法自动处理 contact_verification", "warn")
     start = time.time()
     retry_count = 0
     last_error = ""
@@ -717,8 +701,6 @@ def _run_phase2_with_retry(
             msoutlook_helper_script=str(cfg.get("msoutlook", {}).get("helper_script") or ""),
             save_import=False,
             interactive_input=False,
-            sms_obj=sms_obj,
-            phone_aid=phone_aid,
         )
 
         if oauth_result.get("ok"):
@@ -778,11 +760,10 @@ def _run_phase2_with_retry(
             break
 
         if any(kw in last_error for kw in PHONE_STATE_PHASE2_KEYWORDS):
-            # worker_pool 的 Phase 2 紧接 Phase 1，持有同一号码的 activation_id，
-            # run_second_half 已经拿这个 activation 尝试过 contact_verification。
-            # 如果仍失败，这是账号/手机号/SMS 状态问题，不是 Outlook 邮箱问题；
-            # 不能换邮箱重试，也不能把当前邮箱标坏。
-            log(f"账号手机二次验证无法完成，跳过本账号: {last_error}", "error")
+            # Phase 2 只负责登录已注册账号、绑定邮箱、拿 OAuth code、上传 SUB。
+            # 如果登录后仍要求 contact_verification，说明 Phase 1 没有把账号带到
+            # 可继续绑邮箱的稳定状态；这里不能再重发手机 OTP，也不能换邮箱重试。
+            log(f"账号仍要求手机二次验证，Phase2 不处理手机 OTP，跳过本账号: {last_error}", "error")
             break
 
         if any(kw in last_error.lower() for kw in FATAL_EMAIL_KEYWORDS):
@@ -936,7 +917,7 @@ def worker(
     log = _make_worker_logger(wid, log_lock, router)
     local_success = 0
     local_attempts = 0
-    max_attempts = max(1, int(worker_max_attempts or target_count * 15))
+    max_attempts = max(1, int(worker_max_attempts or target_count))
     log(f"Worker 启动 (proxy={cfg.get('proxy') or '直连'})", "info")
 
     while local_success < target_count and state.should_continue(global_stop) and local_attempts < max_attempts:
@@ -1148,7 +1129,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--max-price", type=str, default="", help="最高价格，覆盖 config.max_price")
     parser.add_argument("--cooldown", type=float, default=60.0, help="普通失败邮箱冷却秒数")
     parser.add_argument("--phase2-timeout", type=float, default=300.0, help="单次 Phase 2 总耗时上限秒数")
-    parser.add_argument("--max-attempts", type=int, default=0, help="全局最大尝试次数（0=默认 target*15）")
+    parser.add_argument("--max-attempts", type=int, default=0, help="全局最大尝试次数（0=默认 target，即每个目标只取号一次）")
     parser.add_argument("--reuse-phone", type=str, default="", help="复用已注册手机号，只跑 Phase 2，不再拿新号码")
     parser.add_argument("--reuse-activation-id", type=str, default="", help="复用手机号对应的 SMS activation_id")
     parser.add_argument(
@@ -1223,7 +1204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
         result_writer = ResultWriter()
-        effective_max_attempts = args.max_attempts if args.max_attempts > 0 else args.count * 15
+        effective_max_attempts = args.max_attempts if args.max_attempts > 0 else args.count
         state = RunState(args.count, max_attempts=effective_max_attempts)
         workers = []
         effective_workers = min(args.concurrency, args.count)

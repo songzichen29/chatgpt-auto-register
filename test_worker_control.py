@@ -42,6 +42,18 @@ class WorkerControlTests(unittest.TestCase):
         logs = c.log_since(0)
         self.assertTrue(any("hello" in x["text"] for x in logs["lines"]))
 
+    def test_build_worker_command_defaults_to_one_attempt_per_target(self):
+        tmp, root = self.make_root()
+        self.addCleanup(tmp.cleanup)
+        c = worker_control.WorkerProcessController(root)
+        cmd = c.build_worker_command({"count": 2, "concurrency": 1})
+        self.assertNotIn("--max-attempts", cmd)
+
+        cmd = c.build_worker_command({"count": 2, "attempts_per_target": 3})
+        self.assertIn("--max-attempts", cmd)
+        idx = cmd.index("--max-attempts")
+        self.assertEqual(cmd[idx + 1], "6")
+
     def test_dashboard_summary_counts_pool_imports_and_accounts(self):
         tmp, root = self.make_root()
         self.addCleanup(tmp.cleanup)

@@ -238,8 +238,6 @@ def _run_phase2(sse_q, phase1_result, bind_email,
                 sub2api_state=oauth_state,
                 msoutlook_helper_url=ms_helper_url,
                 msoutlook_email=current_email,
-                sms_obj=sms_obj,
-                phone_aid=phone_aid,
             )
             if oauth_result.get("ok"):
                 break
@@ -304,6 +302,9 @@ def _run_phase2(sse_q, phase1_result, bind_email,
                     except Exception:
                         pass
                 # 返回 False，让上层拿新手机号重试
+                return False
+            elif "account_requires_contact_verification" in err:
+                _sse_log(sse_q, "  账号仍要求手机二次验证，Phase2 不处理手机 OTP，换手机号重跑...", "warn")
                 return False
             else:
                 # Non-email errors: network issues → retry; others → give up

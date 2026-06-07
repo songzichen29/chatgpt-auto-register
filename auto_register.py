@@ -351,53 +351,19 @@ def register_one(
                 )
             )
             if session_invalid:
-                if otp_attempt < otp_max_retries - 1:
-                    used_otp_codes.add(str(code).strip())
-                    try:
-                        reg, send_otp_url = _start_registration_session("OTP 会话失效")
-                        try:
-                            resend_result = sms.resend()
-                            if verbose and resend_result:
-                                print(f"  [sms] 已请求平台接收下一条短信: {str(resend_result)[:120]}")
-                        except Exception as e:
-                            if verbose:
-                                print(f"  [sms] 平台请求接收下一条短信失败，继续尝试 OpenAI 发码: {e}")
-                        _retry_call(lambda u=send_otp_url: reg.send_otp(u), sr, label="重新发送验证码")
-                    except Exception as exc:
-                        _last_otp_error = f"OTP 会话重建失败: {exc}"
-                        if _looks_existing_or_auth_step_error(exc):
-                            if verbose:
-                                print(
-                                    "  [session] OTP 后账号可能已进入已注册/半注册状态，"
-                                    "不再重复 register，交给 Phase 2 登录/绑定流程处理"
-                                )
-                            return {
-                                "ok": True,
-                                "phone": phone,
-                                "password": password,
-                                "name": name,
-                                "birthdate": birthdate,
-                                "session_token": "",
-                                "access_token": "",
-                                "activation_id": aid,
-                                "phase1_note": _last_otp_error,
-                            }
-                        break
-                    if verbose:
-                        print(
-                            f"  {_last_otp_error}，[OTP重试 {otp_attempt + 1}/{otp_max_retries - 1}] "
-                            f"已重建登录会话并请求新验证码到 {phone}"
-                        )
-                    code = sms.wait_code(timeout=config["code_timeout"], exclude_codes=list(used_otp_codes))
-                    if not code:
-                        _last_otp_error = "会话重建后验证码超时"
-                        break
-                    used_otp_codes.add(str(code).strip())
-                    if verbose:
-                        print(f"  收到验证码: {code}")
-                    continue
+                # OTP validate 已经到达服务端但没有返回 about_you 的 continue_url。
+                # 这里不能重新 register，也不能把账号当作 Phase 1 成功交给 Phase 2；
+                # 否则同一个号码会在后续 OAuth 里再次触发 contact_verification，
+                # 造成重复请求手机验证码。
                 if verbose:
-                    print(f"  {_last_otp_error}，已用完重试次数")
+                    print(
+                        "  OTP 校验后 auth 会话失效(status=409)，"
+                        "本轮 Phase 1 未完成；不重建 register、不转 Phase 2"
+                    )
+                _last_otp_error = (
+                    "OTP 校验后 auth 会话失效(status=409)，"
+                    "Phase 1 未完成；不重建 register、不转 Phase 2"
+                )
                 break
 
             # status=0 表示 validate 请求本身没有拿到 HTTP 响应，多半是连接/TLS/超时等

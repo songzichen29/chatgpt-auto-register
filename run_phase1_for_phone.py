@@ -434,8 +434,16 @@ def branch_new_account(reg, phone, activation_id):
             )
         )
         if session_invalid:
-            print(f"  → OTP 校验后会话失效(status=409)，账号可能已进入半注册/已注册状态，走已有账号 Phase 2 流程")
-            return branch_contact_verification(reg, phone, activation_id)
+            return {
+                "ok": False,
+                "phone": phone,
+                "password": PASSWORD,
+                "activation_id": activation_id,
+                "error": (
+                    "OTP 校验后 auth 会话失效(status=409)，"
+                    "Phase 1 未完成；不重建 register、不转 Phase 2"
+                ),
+            }
         return {
             "ok": False,
             "phone": phone,
@@ -587,13 +595,6 @@ def branch_contact_verification(reg, phone, activation_id):
     # 4. 跑 run_second_half。这个分支实际会完成 OAuth + 绑邮箱 + exchange-code，
     #    成功时需要写入 imports/import_YYYYMMDD.json，避免后续 batch_phase2 重复跑。
     print(f"\n  跑 Phase 2 OAuth 流程 ...")
-    from phone_sms import PhoneSMS
-
-    sms = PhoneSMS("hero-sms", HERO_SMS_API_KEY)
-    if hasattr(sms, "attach_activation"):
-        sms.attach_activation(activation_id)
-    else:
-        sms._activation_id = activation_id
 
     result = {"ok": False, "error": "not started"}
     fixed_about_you = False
@@ -627,8 +628,6 @@ def branch_contact_verification(reg, phone, activation_id):
             sub2api_state=oauth_state,
             msoutlook_helper_url=ms_helper_url,
             msoutlook_email=email,
-            sms_obj=sms,
-            phone_aid=activation_id,
             save_import=True,
             interactive_input=False,  # 不阻塞等 input
         )
@@ -666,7 +665,7 @@ def branch_contact_verification(reg, phone, activation_id):
             "session_token": session_token or "",
             "access_token": access_token or "",
             "activation_id": activation_id,
-            "branch": "contact_verification_via_phase2",
+            "branch": "phase2_oauth",
             "bind_email": email,
             "sub2api_id": result.get("sub2api_account_id", ""),
             "import_file": result.get("import_file", ""),
@@ -728,7 +727,7 @@ def main():
 
         print(f"\n{'='*50}")
         if result.get("ok"):
-            if result.get("branch") == "contact_verification_via_phase2":
+            if result.get("branch") == "phase2_oauth":
                 print(f"[SUCCESS] 已有账号 OAuth/Phase 2 完成!")
             else:
                 print(f"[SUCCESS] Phase 1 完成!")
@@ -764,7 +763,7 @@ def main():
         print(f"\n结果已保存到: {p}")
 
         if result.get("ok"):
-            if result.get("branch") == "contact_verification_via_phase2" and (
+            if result.get("branch") == "phase2_oauth" and (
                 result.get("import_file") or result.get("import_data") or result.get("sub2api_id")
             ):
                 update_batch_phase2_status(phone, result)

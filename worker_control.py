@@ -1341,7 +1341,6 @@ class RetryController:
         import auto_register as ar
         from msoutlook_pool import MsOutlookPool, load_used_set
         from openai_bind_email import run_second_half
-        from phone_sms import PhoneSMS
         from worker_pool import ResultWriter
 
         cfg = ar.load_config(str(self.root / "config.json"))
@@ -1357,12 +1356,6 @@ class RetryController:
         activation_id = str(item.get("activation_id") or "").strip()
         if not (phone and password):
             raise RuntimeError("缺少 phone/password，无法 Phase 2 续跑")
-        sms_obj = None
-        if activation_id:
-            provider = cfg.get("sms_provider", "smsbower")
-            api_key = ar._get_sms_api_key(cfg, provider)
-            if api_key:
-                sms_obj = PhoneSMS(provider, api_key)
 
         pool = MsOutlookPool(helper_url=helper_url, verbose=False, extra_used=load_used_set())
         fatal_email_keywords = (
@@ -1404,8 +1397,6 @@ class RetryController:
                 msoutlook_helper_mode=str(cfg.get("msoutlook", {}).get("helper_mode") or "http"),
                 msoutlook_helper_script=str(cfg.get("msoutlook", {}).get("helper_script") or ""),
                 save_import=False, interactive_input=False,
-                sms_obj=sms_obj,
-                phone_aid=activation_id,
             )
             if result.get("ok"):
                 pool.mark_used(current_email, phone=phone, password=password)
@@ -1427,6 +1418,8 @@ class RetryController:
             if any(kw in err.lower() for kw in fatal_email_keywords):
                 pool.mark_error(current_email, "token_compromised", phone=phone, password=password)
                 continue
+            if "account_requires_contact_verification" in err:
+                raise RuntimeError("账号仍要求手机二次验证，Phase2 不处理手机 OTP")
             raise RuntimeError(err or "Phase 2 retry failed")
         raise RuntimeError("换邮箱重试耗尽")
 

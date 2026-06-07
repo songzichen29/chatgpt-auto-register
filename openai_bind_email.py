@@ -956,10 +956,9 @@ def run_second_half(
             log("[5] contact_verification，需要验证手机 OTP ...")
             if not (bind_code or (sms_obj and phone_aid) or interactive_input):
                 # batch_phase2 这类“已注册账号续跑 Phase 2”场景没有 SMS activation_id，
-                # 也不应该为了续跑主动重发短信或阻塞 input。
-                # worker_pool 刚跑完 Phase 1，持有 activation_id，会通过 sms_obj/phone_aid
-                # 进入下面的自动收码流程。
-                # 这里直接返回账号状态异常，让外层跳过/记录，不触碰邮箱池。
+                # worker_pool/页面注册入口也不会再把 Phase 1 的 activation 传进来。
+                # Phase 2 只负责已注册账号的邮箱绑定/OAuth 上传；如果账号仍要求
+                # 手机二次验证，直接返回账号状态异常，不主动重发短信、不阻塞 input。
                 return {
                     "ok": False,
                     "error": "account_requires_contact_verification",

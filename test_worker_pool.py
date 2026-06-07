@@ -16,7 +16,7 @@ import worker_pool
 
 
 class WorkerPoolComponentTests(unittest.TestCase):
-    def test_validate_otp_uses_authorize_continue_fallback(self):
+    def test_validate_otp_uses_plain_contact_validate_request(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
         calls = []
 
@@ -30,8 +30,10 @@ class WorkerPoolComponentTests(unittest.TestCase):
         self.assertEqual(result["continue_url"], "/about-you")
         self.assertEqual(calls[0][0], "/api/accounts/phone-otp/validate")
         self.assertEqual(calls[0][1], {"code": "123456"})
-        self.assertEqual(calls[0][2]["flow"], "authorize_continue")
         self.assertEqual(calls[0][2]["referer"], "https://auth.openai.com/contact-verification")
+        self.assertIs(calls[0][2]["sentinel"], False)
+        self.assertIs(calls[0][2]["rebuild_on_transport"], False)
+        self.assertNotIn("flow", calls[0][2])
 
     def test_create_account_uses_oauth_create_account_fallback(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
@@ -56,12 +58,80 @@ class WorkerPoolComponentTests(unittest.TestCase):
         self.assertTrue(auto_register._is_auth_session_invalid_error({"error": {"code": "invalid_state"}}))
         self.assertFalse(auto_register._is_auth_session_invalid_error("name is invalid"))
 
-    def test_otp_rebuild_409_session_invalid_is_existing_account_signal(self):
-        err = (
-            "OTP 会话重建失败: 注册被拒(status=409): "
-            "{\"error\":{\"message\":\"Your sign-in session is no longer valid. Please start over.\"}}"
-        )
-        self.assertTrue(auto_register._looks_existing_or_auth_step_error(err))
+    def test_register_one_otp_409_does_not_rebuild_or_report_success(self):
+        old_sms = auto_register.PhoneSMS
+        old_register = auto_register.ChatGPTRegister
+        calls = {"register": 0, "send_otp": 0, "create_account": 0}
+
+        class FakeSMS:
+            def __init__(self, *args, **kwargs):
+                self._activation_id = "aid1"
+
+            def get_number(self, *args, **kwargs):
+                return "aid1", "15550001"
+
+            def wait_code(self, *args, **kwargs):
+                return "123456"
+
+        class FakeRegister:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def visit(self):
+                return None
+
+            def get_csrf(self):
+                return "csrf"
+
+            def signin(self, phone, csrf):
+                return "https://auth.openai.com/authorize"
+
+            def jump_to_auth(self, redirect):
+                return "/create-account/password"
+
+            def register_user(self, phone, password):
+                calls["register"] += 1
+                return {"continue_url": "/contact-verification", "_status": 200}
+
+            def send_otp(self, continue_url):
+                calls["send_otp"] += 1
+
+            def validate_otp(self, code):
+                return {
+                    "_status": 409,
+                    "_body": "Your sign-in session is no longer valid. Please start over.",
+                }
+
+            def create_account(self, name, birthdate):
+                calls["create_account"] += 1
+                return {"continue_url": "https://callback.example", "_status": 200}
+
+        auto_register.PhoneSMS = FakeSMS
+        auto_register.ChatGPTRegister = FakeRegister
+        try:
+            result = auto_register.register_one(
+                {
+                    "sms_provider": "smsbower",
+                    "smsbower": {"api_key": "key"},
+                    "service": "dr",
+                    "country": "16",
+                    "register": {"password": "pw", "name": "A", "birthdate": "2000-01-01"},
+                    "proxy": "",
+                    "code_timeout": 1,
+                },
+                verbose=False,
+                step_retries=0,
+                auto_activate=False,
+            )
+        finally:
+            auto_register.PhoneSMS = old_sms
+            auto_register.ChatGPTRegister = old_register
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Phase 1 未完成", result["error"])
+        self.assertEqual(calls["register"], 1)
+        self.assertEqual(calls["send_otp"], 1)
+        self.assertEqual(calls["create_account"], 0)
 
     def test_auth_json_fallback_retries_transport_error_with_http1_rebuild(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
@@ -657,7 +727,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(records["old@example.com"]["phone"], "+1")
             self.assertEqual(records["old@example.com"]["password"], "pw")
 
-    def test_phase2_contact_verification_uses_phase1_sms_and_does_not_mark_email_error(self):
+    def test_phase2_contact_verification_does_not_use_phase1_sms_or_mark_email_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             pool_path = tmp_path / "pool.json"
@@ -686,8 +756,8 @@ class WorkerPoolComponentTests(unittest.TestCase):
             def fake_run(**kwargs):
                 calls["run"] += 1
                 self.assertIs(kwargs["interactive_input"], False)
-                self.assertEqual(kwargs["phone_aid"], "aid1")
-                self.assertIsInstance(kwargs["sms_obj"], FakeSMS)
+                self.assertNotIn("phone_aid", kwargs)
+                self.assertNotIn("sms_obj", kwargs)
                 return {"ok": False, "error": "account_requires_contact_verification"}
 
             worker_pool._get_oauth_session_with_retry = lambda sub, log: ("http://oauth/?state=s", "sid", "s")
@@ -717,7 +787,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertFalse(outcome.ok)
             self.assertEqual(outcome.final_email, "first@example.com")
             self.assertEqual(calls["run"], 1)
-            self.assertEqual(calls["sms"], [("smsbower", "key1")])
+            self.assertEqual(calls["sms"], [])
             records = json.loads(used_file.read_text(encoding="utf-8")).get("records", {})
             self.assertEqual(records["first@example.com"]["status"], "used")
             self.assertEqual(records["first@example.com"]["phone"], "reserved:W1")
@@ -930,6 +1000,69 @@ class WorkerPoolComponentTests(unittest.TestCase):
             all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
             self.assertEqual(all_data[-1]["status"], "fail_phase2")
             self.assertEqual(all_data[-1]["password"], "pw")
+
+    def test_worker_default_attempts_only_acquires_one_phone_per_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "one@example.com", "enabled": True, "used": False},
+                    {"email": "two@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            writer = worker_pool.ResultWriter(tmp_path / "results", tmp_path / "imports")
+            router = worker_pool.ThreadStdoutRouter.install_once()
+            state = worker_pool.RunState(target_success=1)
+            stop = threading.Event()
+            calls = {"register": 0}
+
+            old_register_one = worker_pool.ar.register_one
+            old_cancel_async = worker_pool._sms_cancel_async
+
+            def fake_register_one(*args, **kwargs):
+                calls["register"] += 1
+                return {
+                    "ok": False,
+                    "phone": "+100",
+                    "password": "pw",
+                    "activation_id": "aid",
+                    "error": "验证码超时",
+                }
+
+            worker_pool.ar.register_one = fake_register_one
+            worker_pool._sms_cancel_async = (
+                lambda cfg, aid, phone, reason, log, state_obj: state_obj.record_cancelled()
+            )
+            try:
+                worker_pool.worker(
+                    wid=1,
+                    config={"sub2api": {"url": "u", "email": "e", "pwd": "p"}, "msoutlook": {"helper_url": ""}},
+                    target_count=1,
+                    global_stop=stop,
+                    allocator=allocator,
+                    result_writer=writer,
+                    router=router,
+                    log_lock=threading.Lock(),
+                    state=state,
+                    step_retries=0,
+                    create_retries=1,
+                    cooldown=0,
+                    phase2_timeout=1,
+                )
+            finally:
+                worker_pool.ar.register_one = old_register_one
+                worker_pool._sms_cancel_async = old_cancel_async
+                router.restore()
+
+            self.assertEqual(calls["register"], 1)
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["attempts"], 1)
+            self.assertEqual(snapshot["phase1_failed"], 1)
 
     def test_worker_phase2_retryable_rate_limit_does_not_cancel_activation(self):
         self.assertTrue(worker_pool._is_retryable_phase2_error("rate_limit_exceeded"))

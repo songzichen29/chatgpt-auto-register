@@ -336,12 +336,15 @@ class ChatGPTRegister:
     # ---- Step 7: 验证 OTP 验证码 ----
     def validate_otp(self, code: str) -> dict:
         self._log(7, "POST /api/accounts/phone-otp/validate ...")
-        # 统一 fallback：第一枪 curl_cffi，直连失败时 fallback 到标准 requests。
+        # phone-otp/validate 属于当前 contact-verification 步骤；这里使用普通
+        # JSON POST，不能额外强塞 authorize_continue Sentinel，也不能先重建
+        # session，否则服务端容易判断授权步骤不匹配，返回 409/start over。
         return self._post_auth_json_with_fallback(
             "/api/accounts/phone-otp/validate",
             {"code": code},
             referer=f"{AUTH}/contact-verification",
-            flow="authorize_continue",
+            sentinel=False,
+            rebuild_on_transport=False,
         )
 
     # ---- Step 8: 创建账户 (用户名+生日) ----
