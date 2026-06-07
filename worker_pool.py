@@ -653,6 +653,22 @@ def _run_phase2_with_retry(
     sub_email = sub.get("email") or ""
     sub_pwd = sub.get("pwd") or ""
     active_lease: Optional[EmailLease] = initial_lease
+    phone_aid = str(activation_id or phase1_result.get("activation_id") or "").strip()
+    sms_obj = None
+    if phone_aid:
+        provider = cfg.get("sms_provider", "smsbower")
+        api_key = ar._get_sms_api_key(cfg, provider)
+        if api_key:
+            try:
+                sms_obj = PhoneSMS(provider, api_key)
+                if hasattr(sms_obj, "attach_activation"):
+                    sms_obj.attach_activation(phone_aid)
+                else:
+                    sms_obj._activation_id = phone_aid
+            except Exception as exc:
+                log(f"Phase2 SMS 客户端初始化失败: {exc}", "warn")
+        else:
+            log("Phase2 有 activation_id 但缺少 SMS API key，无法自动处理 contact_verification", "warn")
     start = time.time()
     retry_count = 0
     last_error = ""
@@ -701,6 +717,8 @@ def _run_phase2_with_retry(
             msoutlook_helper_script=str(cfg.get("msoutlook", {}).get("helper_script") or ""),
             save_import=False,
             interactive_input=False,
+            sms_obj=sms_obj,
+            phone_aid=phone_aid,
         )
 
         if oauth_result.get("ok"):
@@ -715,13 +733,16 @@ def _run_phase2_with_retry(
 
         last_error = oauth_result.get("error", "") or "Phase 2 failed"
         if "codex_about_you_missing_email" in last_error and not fixed_about_you:
-            fix = _complete_about_you_via_chat_client(
-                cfg=cfg,
-                phone=phase1_result["phone"],
-                password=phase1_result["password"],
-                log=log,
-                create_retries=int(cfg.get("_create_retries", 20) or 20),
-            )
+            try:
+                fix = _complete_about_you_via_chat_client(
+                    cfg=cfg,
+                    phone=phase1_result["phone"],
+                    password=phase1_result["password"],
+                    log=log,
+                    create_retries=int(cfg.get("_create_retries", 20) or 20),
+                )
+            except Exception as exc:
+                fix = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             if fix.get("ok"):
                 fixed_about_you = True
                 log("missing_email 修复完成，重新获取 Codex OAuth URL 后继续 Phase2", "warn")
@@ -1010,17 +1031,26 @@ def worker(
             state.record_interrupted()
             break
 
-        with router.capture_current_thread(lambda line: log(line, "info")):
-            outcome = _run_phase2_with_retry(
-                wid=wid,
-                cfg=cfg,
-                phase1_result=result,
-                initial_lease=lease,
-                allocator=allocator,
-                log=log,
-                stop_event=global_stop,
-                total_timeout=phase2_timeout,
-                activation_id=activation_id,
+        try:
+            with router.capture_current_thread(lambda line: log(line, "info")):
+                outcome = _run_phase2_with_retry(
+                    wid=wid,
+                    cfg=cfg,
+                    phase1_result=result,
+                    initial_lease=lease,
+                    allocator=allocator,
+                    log=log,
+                    stop_event=global_stop,
+                    total_timeout=phase2_timeout,
+                    activation_id=activation_id,
+                )
+        except Exception as exc:
+            log(f"Phase 2 异常: {type(exc).__name__}: {exc}", "error")
+            outcome = Phase2Outcome(
+                ok=False,
+                final_email=lease.email,
+                lease=lease,
+                error=f"Phase 2 异常: {type(exc).__name__}: {exc}",
             )
 
         active_lease = outcome.lease

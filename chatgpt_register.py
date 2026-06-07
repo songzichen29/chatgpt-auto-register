@@ -350,6 +350,10 @@ class ChatGPTRegister:
     # ---- Step 8: 创建账户 (用户名+生日) ----
     def create_account(self, name: str, birthdate: str) -> dict:
         self._log(8, "POST /api/accounts/create_account ...")
+        # create_account 对上一步 phone-otp/validate 后的连接/会话状态很敏感。
+        # 先重建底层 HTTP session（保留 Cookie），避免复用已失效连接导致
+        # 服务端返回 invalid_state / session is no longer valid。
+        self._rebuild_session()
         return self._post_auth_json_with_fallback(
             "/api/accounts/create_account",
             {"name": name, "birthdate": birthdate},

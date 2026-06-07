@@ -38,15 +38,18 @@ class WorkerPoolComponentTests(unittest.TestCase):
     def test_create_account_uses_oauth_create_account_fallback(self):
         reg = chatgpt_register.ChatGPTRegister(verbose=False)
         calls = []
+        rebuild_calls = []
 
         def fake_post(path, payload, **kwargs):
             calls.append((path, payload, kwargs))
             return {"continue_url": "https://callback.example", "_status": 200}
 
         reg._post_auth_json_with_fallback = fake_post
+        reg._rebuild_session = lambda **kwargs: rebuild_calls.append(kwargs)
         result = reg.create_account("A", "2000-01-01")
 
         self.assertEqual(result["continue_url"], "https://callback.example")
+        self.assertEqual(rebuild_calls, [{}])
         self.assertEqual(calls[0][0], "/api/accounts/create_account")
         self.assertEqual(calls[0][1], {"name": "A", "birthdate": "2000-01-01"})
         self.assertEqual(calls[0][2]["flow"], "oauth_create_account")
@@ -727,7 +730,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(records["old@example.com"]["phone"], "+1")
             self.assertEqual(records["old@example.com"]["password"], "pw")
 
-    def test_phase2_contact_verification_does_not_use_phase1_sms_or_mark_email_error(self):
+    def test_phase2_contact_verification_uses_phase1_sms_and_does_not_mark_email_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             pool_path = tmp_path / "pool.json"
@@ -751,13 +754,18 @@ class WorkerPoolComponentTests(unittest.TestCase):
                 def __init__(self, provider, api_key):
                     self.provider = provider
                     self.api_key = api_key
+                    self._activation_id = ""
                     calls["sms"].append((provider, api_key))
+
+                def attach_activation(self, activation_id):
+                    self._activation_id = activation_id
 
             def fake_run(**kwargs):
                 calls["run"] += 1
                 self.assertIs(kwargs["interactive_input"], False)
-                self.assertNotIn("phone_aid", kwargs)
-                self.assertNotIn("sms_obj", kwargs)
+                self.assertEqual(kwargs["phone_aid"], "aid1")
+                self.assertIsInstance(kwargs["sms_obj"], FakeSMS)
+                self.assertEqual(kwargs["sms_obj"]._activation_id, "aid1")
                 return {"ok": False, "error": "account_requires_contact_verification"}
 
             worker_pool._get_oauth_session_with_retry = lambda sub, log: ("http://oauth/?state=s", "sid", "s")
@@ -787,7 +795,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertFalse(outcome.ok)
             self.assertEqual(outcome.final_email, "first@example.com")
             self.assertEqual(calls["run"], 1)
-            self.assertEqual(calls["sms"], [])
+            self.assertEqual(calls["sms"], [("smsbower", "key1")])
             records = json.loads(used_file.read_text(encoding="utf-8")).get("records", {})
             self.assertEqual(records["first@example.com"]["status"], "used")
             self.assertEqual(records["first@example.com"]["phone"], "reserved:W1")
@@ -929,6 +937,50 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(calls["fix"], 2)
             self.assertEqual(calls["sleep"], [60])
 
+    def test_phase2_missing_email_fix_exception_returns_outcome_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "first@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            lease = allocator.acquire(1)
+            old_get = worker_pool._get_oauth_session_with_retry
+            old_run = worker_pool.run_second_half
+            old_fix = worker_pool._complete_about_you_via_chat_client
+
+            worker_pool._get_oauth_session_with_retry = lambda sub, log: ("http://oauth/?state=s", "sid", "s")
+            worker_pool.run_second_half = lambda **kwargs: {
+                "ok": False,
+                "error": "codex_about_you_missing_email: about_you",
+            }
+            worker_pool._complete_about_you_via_chat_client = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("ssl eof"))
+            try:
+                outcome = worker_pool._run_phase2_with_retry(
+                    wid=1,
+                    cfg={"sub2api": {"url": "u", "email": "e", "pwd": "p"}, "icloud": {}, "msoutlook": {"helper_url": ""}},
+                    phase1_result={"phone": "+1", "password": "pw", "activation_id": "aid"},
+                    initial_lease=lease,
+                    allocator=allocator,
+                    log=lambda msg, tag="info": None,
+                    stop_event=threading.Event(),
+                    max_retries=1,
+                )
+            finally:
+                worker_pool._get_oauth_session_with_retry = old_get
+                worker_pool.run_second_half = old_run
+                worker_pool._complete_about_you_via_chat_client = old_fix
+
+            self.assertFalse(outcome.ok)
+            self.assertIn("ssl eof", outcome.error)
+            self.assertEqual(outcome.final_email, "first@example.com")
+
     def test_worker_phase2_failure_saves_fail_phase2_without_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1000,6 +1052,69 @@ class WorkerPoolComponentTests(unittest.TestCase):
             all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
             self.assertEqual(all_data[-1]["status"], "fail_phase2")
             self.assertEqual(all_data[-1]["password"], "pw")
+
+    def test_worker_phase2_exception_records_failure_and_releases_email(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pool_path = tmp_path / "pool.json"
+            used_file = tmp_path / "used.json"
+            pool_path.write_text(
+                json.dumps([
+                    {"email": "only@example.com", "enabled": True, "used": False},
+                ]),
+                encoding="utf-8",
+            )
+
+            allocator = worker_pool.EmailAllocator("", pool_path=str(pool_path), used_file=str(used_file))
+            writer = worker_pool.ResultWriter(tmp_path / "results", tmp_path / "imports")
+            router = worker_pool.ThreadStdoutRouter.install_once()
+            state = worker_pool.RunState(target_success=1, max_attempts=1)
+            stop = threading.Event()
+            cancel_jobs = []
+
+            old_register_one = worker_pool.ar.register_one
+            old_phase2 = worker_pool._run_phase2_with_retry
+            old_cancel_async = worker_pool._sms_cancel_async
+            worker_pool.ar.register_one = lambda *args, **kwargs: {
+                "ok": True,
+                "phone": "+100",
+                "password": "pw",
+                "activation_id": "aid",
+            }
+            worker_pool._run_phase2_with_retry = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+            worker_pool._sms_cancel_async = lambda cfg, aid, phone, reason, log, state_obj: cancel_jobs.append((aid, phone, reason)) or state_obj.record_cancelled()
+            try:
+                worker_pool.worker(
+                    wid=1,
+                    config={"sub2api": {"url": "u", "email": "e", "pwd": "p"}, "msoutlook": {"helper_url": ""}},
+                    target_count=1,
+                    global_stop=stop,
+                    allocator=allocator,
+                    result_writer=writer,
+                    router=router,
+                    log_lock=threading.Lock(),
+                    state=state,
+                    step_retries=0,
+                    create_retries=1,
+                    cooldown=0,
+                    phase2_timeout=1,
+                    worker_max_attempts=1,
+                )
+            finally:
+                worker_pool.ar.register_one = old_register_one
+                worker_pool._run_phase2_with_retry = old_phase2
+                worker_pool._sms_cancel_async = old_cancel_async
+                router.restore()
+
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["phase2_failed"], 1)
+            self.assertEqual(cancel_jobs, [("aid", "+100", "Phase 2 失败")])
+            all_data = json.loads((tmp_path / "results" / "_all.json").read_text(encoding="utf-8"))
+            self.assertEqual(all_data[-1]["status"], "fail_phase2")
+            self.assertIn("boom", all_data[-1]["phase2_error"])
+            records = json.loads(used_file.read_text(encoding="utf-8")).get("records", {})
+            self.assertEqual(records, {})
+            self.assertEqual(allocator.pool.get_available_email(), "only@example.com")
 
     def test_worker_default_attempts_retries_after_sms_timeout_and_stops_after_success(self):
         with tempfile.TemporaryDirectory() as tmp:

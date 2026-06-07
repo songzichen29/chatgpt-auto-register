@@ -62,7 +62,7 @@ FATAL_EMAIL_KEYWORDS = (
 STATUS_FILE = Path("batch_phase2_status.json")
 
 # 已注册的手机号列表
-ALL_PHONES = ['+447927101702']  # 替换为实际手机号列表
+ALL_PHONES = ['+56946713024'] # 替换为实际手机号列表
 
 # 加载已上传的号码（跳过）
 def load_uploaded():
