@@ -18,12 +18,12 @@
       <label>并发数</label><input id="run-concurrency" type="number" value="1" min="1" max="10">
       <label>步骤重试</label><input id="run-retry" type="number" value="2" min="0">
       <label>创建重试</label><input id="run-create-retry" type="number" value="20" min="1">
-      <label>每目标尝试次数（0=默认1）</label><input id="run-attempts-per-target" type="number" value="0" min="0">
+      <label>每目标尝试次数（0=默认15）</label><input id="run-attempts-per-target" type="number" value="0" min="0">
       <label>Phase2 超时秒</label><input id="run-phase2-timeout" type="number" value="300" min="1">
       <label>冷却秒</label><input id="run-cooldown" type="number" value="60" min="0">
       <label>复用手机号（可空）</label><input id="run-reuse-phone" placeholder="例如 56971805321">
       <label>复用 activation_id（可空）</label><input id="run-reuse-activation-id" placeholder="例如 460524959">
-      <div class="status">说明：步骤重试只控制单个注册步骤；每目标尝试次数会乘以目标数量后限制总循环。默认每个目标只取号一次；复用模式不会拿新号码。</div>
+      <div class="status">说明：步骤重试只控制单个注册步骤；每目标尝试次数会乘以目标数量后限制总循环。同一轮只持有一个号码，失败后可换号重试；成功后停止。复用模式不会拿新号码。</div>
       <div class="row" style="margin-top:10px"><button class="primary" id="btn-start" onclick="startWorker()">开始</button><button class="danger" id="btn-stop" onclick="stopWorker()">停止</button></div>
       <div class="status" id="run-status">就绪</div>
     </div>

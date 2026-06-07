@@ -1001,7 +1001,7 @@ class WorkerPoolComponentTests(unittest.TestCase):
             self.assertEqual(all_data[-1]["status"], "fail_phase2")
             self.assertEqual(all_data[-1]["password"], "pw")
 
-    def test_worker_default_attempts_only_acquires_one_phone_per_target(self):
+    def test_worker_default_attempts_retries_after_sms_timeout_and_stops_after_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             pool_path = tmp_path / "pool.json"
@@ -1019,25 +1019,52 @@ class WorkerPoolComponentTests(unittest.TestCase):
             router = worker_pool.ThreadStdoutRouter.install_once()
             state = worker_pool.RunState(target_success=1)
             stop = threading.Event()
-            calls = {"register": 0}
+            calls = {"register": 0, "phase2": 0, "complete": 0}
+            cancel_jobs = []
 
             old_register_one = worker_pool.ar.register_one
+            old_phase2 = worker_pool._run_phase2_with_retry
+            old_sms_action = worker_pool._sms_action
             old_cancel_async = worker_pool._sms_cancel_async
 
             def fake_register_one(*args, **kwargs):
                 calls["register"] += 1
+                if calls["register"] == 1:
+                    return {
+                        "ok": False,
+                        "phone": "+100",
+                        "password": "pw",
+                        "activation_id": "aid1",
+                        "error": "验证码超时",
+                    }
                 return {
-                    "ok": False,
-                    "phone": "+100",
+                    "ok": True,
+                    "phone": "+200",
                     "password": "pw",
-                    "activation_id": "aid",
-                    "error": "验证码超时",
+                    "session_token": "st",
+                    "access_token": "at",
+                    "activation_id": "aid2",
                 }
 
             worker_pool.ar.register_one = fake_register_one
-            worker_pool._sms_cancel_async = (
-                lambda cfg, aid, phone, reason, log, state_obj: state_obj.record_cancelled()
-            )
+
+            def fake_phase2(**kwargs):
+                calls["phase2"] += 1
+                return worker_pool.Phase2Outcome(
+                    ok=True,
+                    final_email=kwargs["initial_lease"].email,
+                    lease=kwargs["initial_lease"],
+                    sub2api_id="sub-id",
+                )
+
+            def fake_sms_action(_cfg, _aid, action):
+                if action == "complete":
+                    calls["complete"] += 1
+                return True
+
+            worker_pool._run_phase2_with_retry = fake_phase2
+            worker_pool._sms_action = fake_sms_action
+            worker_pool._sms_cancel_async = lambda cfg, aid, phone, reason, log, state_obj: cancel_jobs.append((aid, phone, reason)) or state_obj.record_cancelled()
             try:
                 worker_pool.worker(
                     wid=1,
@@ -1056,13 +1083,17 @@ class WorkerPoolComponentTests(unittest.TestCase):
                 )
             finally:
                 worker_pool.ar.register_one = old_register_one
+                worker_pool._run_phase2_with_retry = old_phase2
+                worker_pool._sms_action = old_sms_action
                 worker_pool._sms_cancel_async = old_cancel_async
                 router.restore()
 
-            self.assertEqual(calls["register"], 1)
+            self.assertEqual(calls, {"register": 2, "phase2": 1, "complete": 1})
+            self.assertEqual(cancel_jobs, [("aid1", "+100", "Phase 1 失败")])
             snapshot = state.snapshot()
-            self.assertEqual(snapshot["attempts"], 1)
+            self.assertEqual(snapshot["attempts"], 2)
             self.assertEqual(snapshot["phase1_failed"], 1)
+            self.assertEqual(snapshot["full_success"], 1)
 
     def test_worker_phase2_retryable_rate_limit_does_not_cancel_activation(self):
         self.assertTrue(worker_pool._is_retryable_phase2_error("rate_limit_exceeded"))

@@ -917,7 +917,7 @@ def worker(
     log = _make_worker_logger(wid, log_lock, router)
     local_success = 0
     local_attempts = 0
-    max_attempts = max(1, int(worker_max_attempts or target_count))
+    max_attempts = max(1, int(worker_max_attempts or target_count * 15))
     log(f"Worker 启动 (proxy={cfg.get('proxy') or '直连'})", "info")
 
     while local_success < target_count and state.should_continue(global_stop) and local_attempts < max_attempts:
@@ -1129,7 +1129,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--max-price", type=str, default="", help="最高价格，覆盖 config.max_price")
     parser.add_argument("--cooldown", type=float, default=60.0, help="普通失败邮箱冷却秒数")
     parser.add_argument("--phase2-timeout", type=float, default=300.0, help="单次 Phase 2 总耗时上限秒数")
-    parser.add_argument("--max-attempts", type=int, default=0, help="全局最大尝试次数（0=默认 target，即每个目标只取号一次）")
+    parser.add_argument("--max-attempts", type=int, default=0, help="全局最大尝试次数（0=默认 target*15；单轮只取一个号，失败后可换号重试）")
     parser.add_argument("--reuse-phone", type=str, default="", help="复用已注册手机号，只跑 Phase 2，不再拿新号码")
     parser.add_argument("--reuse-activation-id", type=str, default="", help="复用手机号对应的 SMS activation_id")
     parser.add_argument(
@@ -1204,7 +1204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
         result_writer = ResultWriter()
-        effective_max_attempts = args.max_attempts if args.max_attempts > 0 else args.count
+        effective_max_attempts = args.max_attempts if args.max_attempts > 0 else args.count * 15
         state = RunState(args.count, max_attempts=effective_max_attempts)
         workers = []
         effective_workers = min(args.concurrency, args.count)

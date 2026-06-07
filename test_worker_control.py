@@ -42,7 +42,7 @@ class WorkerControlTests(unittest.TestCase):
         logs = c.log_since(0)
         self.assertTrue(any("hello" in x["text"] for x in logs["lines"]))
 
-    def test_build_worker_command_defaults_to_one_attempt_per_target(self):
+    def test_build_worker_command_attempts_per_target_is_optional_override(self):
         tmp, root = self.make_root()
         self.addCleanup(tmp.cleanup)
         c = worker_control.WorkerProcessController(root)
